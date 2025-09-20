@@ -28,7 +28,7 @@ Switch to text mode for direct PWL syntax editing with real-time validation and 
 ## Installation
 
 ### Option 1: Pre-built Distribution (Recommended)
-Download the latest release from: **[Distribution Links - Coming Soon]**
+Download the latest release from: **[GitHub Releases](https://github.com/dotmjsc/PWL_Editor/releases)**
 
 ### Option 2: Run from Source
 If you prefer to run from source code:

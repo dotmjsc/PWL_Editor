@@ -16,7 +16,7 @@ class PWLEditorGeometry:
         self.callback_handler = callback_handler
         
         self.root.title("PWL Editor - Piecewise Linear Waveform Editor")
-        self.root.geometry("1200x800")
+        self.root.geometry("1200x600")
         
         self.widgets = {}
         
