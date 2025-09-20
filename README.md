@@ -52,17 +52,21 @@ PWL files define piecewise linear waveforms using time-value pairs. Values are u
 
 ### Absolute Time Format
 ```
-0 0        # Time=0s, Value=0
-1m 1       # Time=1ms, Value=1
-2m 2       # Time=2ms, Value=2
+0 0
+1m 1
+2m 2
 ```
+*Time=0s Value=0, Time=1ms Value=1, Time=2ms Value=2*
 
-### Relative Time Format (Delta)
+### Relative Time Format (LTSpice Delta Format)
 ```
-0 0        # Time=0s, Value=0
-+1m 1      # Time=previous+1ms, Value=1
-+1m 2      # Time=previous+1ms, Value=2
+0 0
++1m 1
++1m 2
 ```
+*Time=0s Value=0, Time=previous+1ms Value=1, Time=previous+1ms Value=2*
+
+**Note:** Relative time format (+ prefix) is LTSpice-specific and may not be compatible with other SPICE simulators like Microcap.
 
 ### Mixed Format
 Both formats can be mixed in the same file. The editor provides smart conversion between formats while preserving the waveform shape.
