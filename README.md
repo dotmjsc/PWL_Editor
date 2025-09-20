@@ -71,6 +71,16 @@ PWL files define piecewise linear waveforms using time-value pairs. Values are u
 ### Mixed Format
 Both formats can be mixed in the same file. The editor provides smart conversion between formats while preserving the waveform shape.
 
+## Export Format Settings
+
+The text editor includes export format controls that determine how time formats are saved to files:
+
+### Export Format Options
+
+- **Preserve Mixed** - Keeps the original mix of absolute and relative time formats as entered
+- **Force Relative** - Converts all time values to relative format (+prefix) when saving
+- **Force Absolute** - Converts all time values to absolute format when saving - Necessary for MicroCap compatibility
+
 ## Examples
 
 The `examples/` folder contains sample PWL files:

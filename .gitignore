@@ -29,6 +29,9 @@ ENV/
 # Build output
 versions/
 
+# GitHub workflow files
+.github/
+
 # IDE
 .vscode/
 .idea/

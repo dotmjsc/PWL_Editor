@@ -1,5 +1,11 @@
 # Changelog
 
+## Version 1.2 (2025-09-20)
+
+### Export Format Settings
+- **Export format dropdown** - Choose format applied when saving files (Preserve Mixed, Force Relative, Force Absolute)
+- **MicroCap compatibility** - Force Absolute format required for MicroCap compatibility
+
 ## Version 1.1 (2025-09-20)
 
 ### Smart Point Insertion

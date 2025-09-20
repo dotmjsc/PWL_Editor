@@ -783,9 +783,11 @@ class PWLEditor:
                 self.table.selection_add(self.table.get_children()[i + 1])
 
     def on_export_format_changed(self, event=None):
-        """Handle export format dropdown change"""
-        # Update the text editor with the new format
-        self.table_to_text_with_format()
+        """Handle export format dropdown change - store setting but don't apply immediately"""
+        # Just store the setting, don't update text editor immediately
+        # The format will be applied when saving
+        selected_format = self.export_format_var.get()
+        self.status_var.set(f"Export format set to: {selected_format} (applies on save)")
     
     def table_to_text_with_format(self):
         """Update text editor using the selected export format"""
@@ -805,6 +807,39 @@ class PWLEditor:
             self.text_editor.insert(1.0, text_content)
         except Exception as e:
             self.status_var.set(f"Error updating text format: {e}")
+    
+    def _get_formatted_content_for_save(self):
+        """Get content formatted according to export format setting for saving"""
+        try:
+            # First ensure data is synchronized from text editor
+            self.text_to_table()
+            
+            # Map display names to format codes
+            format_map = {
+                "Preserve Mixed": "preserve_mixed",
+                "Force Relative": "force_relative", 
+                "Force Absolute": "force_absolute"
+            }
+            
+            selected_format = format_map.get(self.export_format_var.get(), "preserve_mixed")
+            
+            # Apply the selected export format
+            if selected_format == "preserve_mixed":
+                # Use current text editor content as-is
+                return self.text_editor.get(1.0, tk.END).strip()
+            else:
+                # Apply the selected format transformation
+                formatted_content = self.pwl_data.to_text_with_format(
+                    export_format=selected_format, 
+                    precision=9, 
+                    preserve_original=True
+                )
+                return formatted_content.strip()
+                
+        except Exception as e:
+            self.status_var.set(f"Error formatting content for save: {e}")
+            # Fallback to current text editor content
+            return self.text_editor.get(1.0, tk.END).strip()
 
     def sort_data(self):
         """Sort data points by time"""
@@ -1043,8 +1078,8 @@ class PWLEditor:
                     return
             
             try:
-                # Get current text content and save it
-                text_content = self.text_editor.get(1.0, tk.END).strip()
+                # Apply export format setting when saving
+                text_content = self._get_formatted_content_for_save()
                 if text_content:
                     with open(self.current_file, 'w') as f:
                         f.write(text_content)
@@ -1073,8 +1108,8 @@ class PWLEditor:
                 # Remember the directory for next time
                 self.last_directory = os.path.dirname(file_path)
                 
-                # Get current text content and save it
-                text_content = self.text_editor.get(1.0, tk.END).strip()
+                # Apply export format setting when saving
+                text_content = self._get_formatted_content_for_save()
                 if text_content:
                     with open(file_path, 'w') as f:
                         f.write(text_content)
