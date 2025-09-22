@@ -12,7 +12,7 @@ The main interface features a split view with an editable table on the left and 
 ### Text Editor Mode
 ![Text Mode](docs/gui_text_mode.png)
 
-Switch to text mode for direct PWL syntax editing with real-time validation and syntax highlighting.
+Switch to text mode for direct PWL syntax editing with real-time validation.
 
 ## Features
 
