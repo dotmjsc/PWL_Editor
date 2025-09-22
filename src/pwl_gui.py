@@ -12,6 +12,7 @@ import sys
 from pwl_parser import PwlData, PwlPoint
 from pwl_gui_geometry import PWLEditorGeometry
 from pwl_insertion import SmartInsertion
+from pwl_undo import UndoRedoManager
 import pwl_formatting as fmt
 from version import get_version
 
@@ -23,6 +24,11 @@ class PWLEditor:
         self.current_file = None
         self.unsaved_changes = False
         self.last_directory = None  # Remember last used directory
+        
+        # Undo/Redo functionality
+        self.undo_manager = UndoRedoManager(max_history=50)
+        self._operation_description = ""  # Track current operation for undo descriptions
+        self._undo_in_progress = False    # Prevent recursive undo point creation
         
         self.edit_entry = None
         self.edit_combo = None
@@ -42,6 +48,9 @@ class PWLEditor:
         self.update_plot()
         if 'parse_status_var' in self.widgets:
             self.widgets['parse_status_var'].set("No data")
+        
+        # Save initial empty state as baseline
+        self.undo_manager.save_state(self.pwl_data, "Initial state")
     
     @property
     def table(self):
@@ -121,17 +130,26 @@ class PWLEditor:
             self.status_var.set(f"Error updating text: {e}")
 
     def text_to_table(self):
+        """Handle text-to-table conversion with proper undo integration"""
         try:
             text_content = self.text_editor.get(1.0, tk.END).strip()
             if text_content:
                 new_pwl_data = PwlData()
                 if new_pwl_data.load_from_text(text_content):
+                    self._operation_description = "Text to table conversion"
                     self.pwl_data = new_pwl_data
                     self.update_table()
-                    self.update_plot()
+                    self.update_plot()  # This will create the undo point
                     self.mark_unsaved()
                 else:
                     self.status_var.set("Invalid PWL text format")
+            else:
+                # Handle empty text - convert to empty data
+                self._operation_description = "Clear all data"
+                self.pwl_data = PwlData()
+                self.update_table()
+                self.update_plot()  # This will create the undo point
+                self.mark_unsaved()
         except Exception as e:
             self.status_var.set(f"Error parsing text: {e}")
 
@@ -213,7 +231,22 @@ class PWLEditor:
         return fmt.suggest_optimal(value)
     
     def update_plot(self, selected_indices=None):
-        """Update the plot with current PWL data"""
+        """Update plot and create undo point"""
+        # Don't create undo points during undo/redo operations
+        if getattr(self, '_undo_in_progress', False):
+            self._update_plot_internal(selected_indices)
+            return
+        
+        # Save undo point BEFORE updating (captures previous state)
+        if hasattr(self, 'undo_manager'):
+            description = getattr(self, '_operation_description', 'Edit')
+            self.undo_manager.save_state(self.pwl_data, description)
+            self._operation_description = ""  # Reset description
+        
+        self._update_plot_internal(selected_indices)
+
+    def _update_plot_internal(self, selected_indices=None):
+        """Internal plot update without undo point creation"""
         self.ax.clear()
         
         if self.pwl_data.get_point_count() > 0:
@@ -273,8 +306,112 @@ class PWLEditor:
         
         self.canvas.draw()
 
+    def undo(self):
+        """Undo last operation with comprehensive error handling and invalid text handling"""
+        try:
+            # First check if current text editor content is invalid
+            current_text = self.text_editor.get(1.0, tk.END).strip()
+            temp_data = PwlData()
+            
+            # If current text is invalid, just restore current valid state (don't consume undo point)
+            if current_text and not temp_data.load_from_text(current_text):
+                self.table_to_text()  # Sync text editor with current valid data
+                self.status_var.set("Invalid text discarded - restored to last valid state")
+                return
+            
+            # Current text is valid (or empty) - proceed with normal undo
+            # Check if undo is possible
+            if not hasattr(self, 'undo_manager') or not self.undo_manager.can_undo():
+                self.status_var.set("Nothing to undo")
+                return
+            
+            # Get preview of what will be undone
+            undo_description = self.undo_manager.get_undo_description()
+            
+            # Perform undo
+            self._undo_in_progress = True
+            previous_data, description = self.undo_manager.undo()
+            
+            if previous_data is not None:
+                # Store current selection to potentially restore
+                current_selection = list(self.table.selection()) if hasattr(self, 'table') else []
+                
+                # Update data
+                self.pwl_data = previous_data
+                
+                # Update all views
+                self.update_table()
+                self.table_to_text()  # Sync text editor
+                self._update_plot_internal()  # Update plot without new undo point
+                
+                # Try to restore selection if items still exist
+                if current_selection and self.pwl_data.get_point_count() > 0:
+                    try:
+                        for item_id in current_selection:
+                            if self.table.exists(item_id):
+                                self.table.selection_add(item_id)
+                    except:
+                        pass  # Selection restoration is optional
+                
+                self.mark_unsaved()
+                self.status_var.set(f"Undone: {undo_description}")
+            else:
+                self.status_var.set("Undo failed - no previous state")
+                
+        except Exception as e:
+            self.status_var.set(f"Undo error: {str(e)[:30]}...")
+        finally:
+            self._undo_in_progress = False
+
+    def redo(self):
+        """Redo next operation with comprehensive error handling"""
+        try:
+            # Check if redo is possible
+            if not hasattr(self, 'undo_manager') or not self.undo_manager.can_redo():
+                self.status_var.set("Nothing to redo")
+                return
+            
+            # Get preview of what will be redone
+            redo_description = self.undo_manager.get_redo_description()
+            
+            # Perform redo
+            self._undo_in_progress = True
+            next_data, description = self.undo_manager.redo()
+            
+            if next_data is not None:
+                # Store current selection to potentially restore
+                current_selection = list(self.table.selection()) if hasattr(self, 'table') else []
+                
+                # Update data
+                self.pwl_data = next_data
+                
+                # Update all views
+                self.update_table()
+                self.table_to_text()  # Sync text editor
+                self._update_plot_internal()  # Update plot without new undo point
+                
+                # Try to restore selection if items still exist
+                if current_selection and self.pwl_data.get_point_count() > 0:
+                    try:
+                        for item_id in current_selection:
+                            if self.table.exists(item_id):
+                                self.table.selection_add(item_id)
+                    except:
+                        pass  # Selection restoration is optional
+                
+                self.mark_unsaved()
+                self.status_var.set(f"Redone: {redo_description}")
+            else:
+                self.status_var.set("Redo failed - invalid state")
+                
+        except Exception as e:
+            self.status_var.set(f"Redo error: {str(e)[:30]}...")
+        finally:
+            self._undo_in_progress = False
+
     def add_point_above(self):
         """Add point above selected row with smart defaults"""
+        self._operation_description = "Add point above"
         selected = self.table.selection()
         if selected:
             item = selected[0]
@@ -324,6 +461,7 @@ class PWLEditor:
 
     def add_point_below(self):
         """Add point below selected row with smart defaults"""
+        self._operation_description = "Add point below"
         selected = self.table.selection()
         if selected:
             # Get selected item details
@@ -605,6 +743,17 @@ class PWLEditor:
             # Clear any preserved selection state to prevent confusion
             self.previous_selection = None
             
+            # Set operation description based on what was edited
+            if self.edit_column:
+                column_name = self.table.heading(self.edit_column)['text']
+                count = len(selected_items)
+                if count == 1:
+                    self._operation_description = f"Edit {column_name.lower()}"
+                else:
+                    self._operation_description = f"Edit {column_name.lower()} ({count} points)"
+            else:
+                self._operation_description = "Edit value"
+            
             self.update_table()
             self.update_plot()
             self.table_to_text()
@@ -696,6 +845,10 @@ class PWLEditor:
         if not selected_items:
             messagebox.showwarning("No Selection", "Please select a point to remove")
             return
+        
+        # Set operation description based on number of items
+        count = len(selected_items)
+        self._operation_description = f"Remove {count} point{'s' if count > 1 else ''}"
         
         indices_to_remove = []
         for item in selected_items:
@@ -1022,19 +1175,30 @@ class PWLEditor:
             self.status_var.set(f"Error restoring original formatting: {e}")
 
     def new_file(self):
-        """Create new file"""
+        """Create new file - handle undo history appropriately"""
         if self.check_unsaved_changes():
             self.pwl_data.clear()
             self.current_file = None
-            self.update_table()
-            self.update_plot()
-            self.table_to_text()
-            self.unsaved_changes = False
-            self.update_title()
-            self.status_var.set("New file created")
+            
+            # Update views WITHOUT creating undo points
+            self._undo_in_progress = True
+            try:
+                self.update_table()
+                self._update_plot_internal()  # Use internal method to avoid undo point
+                self.table_to_text()
+                self.unsaved_changes = False
+                self.update_title()
+                self.status_var.set("New file created")
+            finally:
+                self._undo_in_progress = False
+            
+            # Clear undo history AFTER clearing data and establish new baseline
+            if hasattr(self, 'undo_manager'):
+                self.undo_manager.clear_history()
+                self.undo_manager.save_state(self.pwl_data, "New file")
 
     def open_file(self):
-        """Open PWL file"""
+        """Open PWL file - handle undo history appropriately"""
         if not self.check_unsaved_changes():
             return
         
@@ -1053,12 +1217,23 @@ class PWLEditor:
                 if new_pwl_data.load_from_file(file_path, 0.001):  # Default 1ms timestep
                     self.pwl_data = new_pwl_data
                     self.current_file = file_path
-                    self.update_table()
-                    self.update_plot()
-                    self.table_to_text()
-                    self.unsaved_changes = False
-                    self.update_title()
-                    self.status_var.set(f"Loaded: {os.path.basename(file_path)}")
+                    
+                    # Update views WITHOUT creating undo points
+                    self._undo_in_progress = True
+                    try:
+                        self.update_table()
+                        self._update_plot_internal()  # Use internal method to avoid undo point
+                        self.table_to_text()
+                        self.unsaved_changes = False
+                        self.update_title()
+                        self.status_var.set(f"Loaded: {os.path.basename(file_path)}")
+                    finally:
+                        self._undo_in_progress = False
+                    
+                    # Clear undo history AFTER loading file and establish new baseline
+                    if hasattr(self, 'undo_manager'):
+                        self.undo_manager.clear_history()
+                        self.undo_manager.save_state(self.pwl_data, f"Opened: {os.path.basename(file_path)}")
                 else:
                     messagebox.showerror("Error", "Failed to load PWL file")
             except Exception as e:
@@ -1160,6 +1335,7 @@ class PWLEditor:
 
     def convert_to_relative(self):
         """Convert text editor content to relative time format"""
+        self._operation_description = "Convert to relative time"
         try:
             # Parse current text content
             text_content = self.text_editor.get(1.0, tk.END).strip()
@@ -1192,6 +1368,7 @@ class PWLEditor:
 
     def convert_to_absolute(self):
         """Convert text editor content to absolute time format"""
+        self._operation_description = "Convert to absolute time"
         try:
             # Parse current text content
             text_content = self.text_editor.get(1.0, tk.END).strip()

@@ -1,5 +1,11 @@
 # Changelog
 
+## Version 1.3 (2025-09-22)
+
+### Undo/Redo
+- **Undo/Redo support** - Standard Ctrl+Z/Y keyboard shortcuts for all operations
+- **Smart text handling** - Undo discards invalid text and restores last valid state
+
 ## Version 1.2 (2025-09-20)
 
 ### Export Format Settings

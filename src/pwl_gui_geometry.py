@@ -68,6 +68,11 @@ class PWLEditorGeometry:
         self.root.bind('<Control-o>', lambda e: self._callback('open_file')())
         self.root.bind('<Control-s>', lambda e: self._callback('save_file')())
         self.root.bind('<Control-S>', lambda e: self._callback('save_file_as')())
+        
+        # Undo/Redo shortcuts
+        self.root.bind('<Control-z>', lambda e: self._callback('undo')())
+        self.root.bind('<Control-y>', lambda e: self._callback('redo')())
+        self.root.bind('<Control-Z>', lambda e: self._callback('redo')())  # Ctrl+Shift+Z
     
     def _callback(self, method_name):
         def wrapper(*args, **kwargs):
