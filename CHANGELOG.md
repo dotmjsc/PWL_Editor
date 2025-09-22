@@ -1,3 +1,18 @@
+## 1.4 - 2025-09-22
+
+Enhancements
+- Plot selection box (Table-only): added robust event lifecycle and border clamping
+- Repeated box selection: fixed stale rectangle cleanup; rectangle can be drawn multiple times
+
+Fixes
+- Undo safety: replaced unintended update_plot() calls in selection/table handlers with _update_plot_internal()
+- Border interactions: clamped pixel coords to axes for drag/move/release, enabling selection when releasing outside plot
+- Undo edge case: guarded max() logging in parser to avoid errors on empty datasets
+
+Internal
+- Connected/disconnected matplotlib events on tab changes; initial connect when starting in Table mode
+- Added GPT-5 (OpenAI) to AI Tools attribution
+
 # Changelog
 
 ## Version 1.3 (2025-09-22)

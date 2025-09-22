@@ -109,3 +109,4 @@ GPL-3.0-or-later
 ## AI Tools Used
 
 - Claude Sonnet 4 (Anthropic) - Code development and architecture
+- GPT-5 (OpenAI) - Code development, selection box implementation, undo fixes

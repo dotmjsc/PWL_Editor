@@ -1,7 +1,7 @@
 """
 PWL Parser - LTSpice-style PWL text parser and data model
 Author: markus(at)schrodt.at
-AI Tools: Claude Sonnet 4 (Anthropic) - Code development and architecture
+AI Tools: Claude Sonnet 4 (Anthropic); GPT-5 (OpenAI) - Code development and architecture
 License: GPL-3.0-or-later
 """
 
@@ -632,12 +632,15 @@ class PwlData:
             return False
 
         self._update_discrete()
-
+        
         # Use the timestamps property for logging (which calculates absolute times)
         timestamps = self.timestamps
         logging.info('PWL Parser: PWL data load successful')
-        logging.info('PWL Parser: Total PWL file run time: %0.3f s' % max(timestamps))
-        logging.info('PWL Parser: Total SMU run time: %0.3f s' % max(self.timestamps_discrete))
+        # Guard against empty lists during edge cases
+        total_run_time = max(timestamps) if len(timestamps) > 0 else 0.0
+        total_smu_time = max(self.timestamps_discrete) if len(self.timestamps_discrete) > 0 else 0.0
+        logging.info('PWL Parser: Total PWL file run time: %0.3f s' % total_run_time)
+        logging.info('PWL Parser: Total SMU run time: %0.3f s' % total_smu_time)
         logging.info('PWL Parser: Nr of points: %d' % len(self.timestamps_discrete))
 
         return True

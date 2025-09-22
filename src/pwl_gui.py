@@ -1,7 +1,7 @@
 """
 PWL Editor Application - Main Application Logic
 Author: markus(at)schrodt.at
-AI Tools: Claude Sonnet 4 (Anthropic) - Code development and architecture
+AI Tools: Claude Sonnet 4 (Anthropic); GPT-5 (OpenAI) - Code development and architecture
 License: GPL-3.0-or-later
 """
 
@@ -38,6 +38,14 @@ class PWLEditor:
         # Multi-selection preservation for editing
         self.previous_selection = None  # Store the selection before current one
         
+        # Plot-to-table selection constants and state
+        self.NEAREST_PX_TOL = 10    # Pixel tolerance for nearest-point selection
+        self.DRAG_THRESHOLD_PX = 5  # Minimum pixels to trigger drag selection
+        self.is_dragging = False    # Track if currently dragging for selection
+        self.drag_start_pos = None  # Starting position for drag selection (pixel coords)
+        self.selection_rect = None  # Current selection rectangle artist
+        self.plot_event_connections = {}  # Store matplotlib event connection IDs
+        
         # Initialize smart insertion handler
         self.smart_insertion = SmartInsertion()
         
@@ -48,6 +56,14 @@ class PWLEditor:
         self.update_plot()
         if 'parse_status_var' in self.widgets:
             self.widgets['parse_status_var'].set("No data")
+        
+        # Ensure plot events are connected if starting in Table mode
+        try:
+            current_tab = self.notebook.tab(self.notebook.select(), 'text')
+            if current_tab == 'Table':
+                self.connect_plot_events()
+        except Exception:
+            pass
         
         # Save initial empty state as baseline
         self.undo_manager.save_state(self.pwl_data, "Initial state")
@@ -110,11 +126,15 @@ class PWLEditor:
         
         if tab_text == 'Table':
             self.text_to_table()
+            # Connect plot selection events when entering Table mode
+            self.connect_plot_events()
         elif tab_text == 'Text':
+            # Disconnect plot events when leaving Table mode
+            self.disconnect_plot_events()
             # Clear table selection when switching to text to avoid issues
             self.table.selection_remove(self.table.selection())
             # Clear plot highlighting
-            self.update_plot(None)
+            self._update_plot_internal(None)
             self.table_to_text()
 
     def table_to_text(self):
@@ -212,7 +232,7 @@ class PWLEditor:
                         selected_indices.append(children.index(item))
             
             # Update plot with highlighting (pass list of indices or None)
-            self.update_plot(selected_indices if selected_indices else None)
+            self._update_plot_internal(selected_indices if selected_indices else None)
             
         except Exception as e:
             # Fail silently - highlighting is a nice-to-have feature
@@ -247,7 +267,11 @@ class PWLEditor:
 
     def _update_plot_internal(self, selected_indices=None):
         """Internal plot update without undo point creation"""
+        # Clear plot (this also removes any existing patches)
         self.ax.clear()
+        # Any previously stored selection rectangle reference is now invalid
+        # Ensure we don't try to remove a stale artist later
+        self.selection_rect = None
         
         if self.pwl_data.get_point_count() > 0:
             times = self.pwl_data.timestamps
@@ -305,6 +329,341 @@ class PWLEditor:
         self.ax.set_title(f'PWL Waveform ({self.pwl_data.get_point_count()} points)')
         
         self.canvas.draw()
+
+    def data_to_pixel(self, data_x, data_y):
+        """Convert data coordinates to pixel coordinates"""
+        try:
+            if not self.ax or self.pwl_data.get_point_count() == 0:
+                return None, None
+            
+            # Use matplotlib transform to convert data to pixel coordinates
+            pixel_coords = self.ax.transData.transform([(data_x, data_y)])
+            return pixel_coords[0][0], pixel_coords[0][1]
+        except Exception:
+            return None, None
+
+    def pixel_to_data(self, pixel_x, pixel_y):
+        """Convert pixel coordinates to data coordinates"""
+        try:
+            if not self.ax or self.pwl_data.get_point_count() == 0:
+                return None, None
+            
+            # Use matplotlib transform to convert pixel to data coordinates
+            data_coords = self.ax.transData.inverted().transform([(pixel_x, pixel_y)])
+            return data_coords[0][0], data_coords[0][1]
+        except Exception:
+            return None, None
+
+    def _clamp_pixel_to_axes(self, px, py):
+        """Clamp pixel coordinates to the axes bounding box to support border drags."""
+        try:
+            if not self.ax:
+                return px, py
+            # axes bbox in display (pixel) coords
+            bbox = self.ax.get_window_extent()
+            clamped_x = min(max(px, bbox.x0), bbox.x1)
+            clamped_y = min(max(py, bbox.y0), bbox.y1)
+            return clamped_x, clamped_y
+        except Exception:
+            return px, py
+
+    def on_plot_press(self, event):
+        """Handle mouse press on plot for selection"""
+        try:
+            # Only process in Table mode
+            selected_tab = self.notebook.select()
+            tab_text = self.notebook.tab(selected_tab, 'text')
+            if tab_text != 'Table':
+                return
+            
+            # Ignore if inline editing is active
+            if (self.edit_entry is not None or self.edit_combo is not None or 
+                self.edit_item is not None):
+                return
+            
+            # Only process left mouse button
+            if event.button != 1:
+                return
+            
+            # Clear any existing selection rectangle (be robust if already cleared)
+            if self.selection_rect:
+                try:
+                    self.selection_rect.remove()
+                except Exception:
+                    pass
+                finally:
+                    self.selection_rect = None
+                self.canvas.draw()
+            
+            # Store drag start position (pixel coordinates), clamped to axes
+            sx, sy = self._clamp_pixel_to_axes(event.x, event.y)
+            self.drag_start_pos = (sx, sy)
+            self.is_dragging = False
+            
+        except Exception:
+            # Fail silently for robustness
+            pass
+
+    def on_plot_motion(self, event):
+        """Handle mouse motion on plot for drag selection"""
+        try:
+            # Only process in Table mode
+            selected_tab = self.notebook.select()
+            tab_text = self.notebook.tab(selected_tab, 'text')
+            if tab_text != 'Table':
+                return
+            
+            # Ignore if inline editing is active
+            if (self.edit_entry is not None or self.edit_combo is not None or 
+                self.edit_item is not None):
+                return
+            
+            # Must have started drag; allow moves outside axes (we'll clamp)
+            if not self.drag_start_pos:
+                return
+            
+            # Calculate drag distance
+            dx = event.x - self.drag_start_pos[0]
+            dy = event.y - self.drag_start_pos[1]
+            drag_distance = (dx*dx + dy*dy)**0.5
+            
+            # Start dragging if threshold exceeded
+            if drag_distance >= self.DRAG_THRESHOLD_PX:
+                self.is_dragging = True
+                
+                # Update selection rectangle
+                # Clamp current point to axes to keep rectangle visible at borders
+                cx, cy = self._clamp_pixel_to_axes(event.x, event.y)
+                self.update_selection_rectangle(self.drag_start_pos, (cx, cy))
+            
+        except Exception:
+            # Fail silently for robustness
+            pass
+
+    def on_plot_release(self, event):
+        """Handle mouse release on plot for selection completion"""
+        try:
+            # Only process in Table mode
+            selected_tab = self.notebook.select()
+            tab_text = self.notebook.tab(selected_tab, 'text')
+            if tab_text != 'Table':
+                return
+            
+            # Ignore if inline editing is active
+            if (self.edit_entry is not None or self.edit_combo is not None or 
+                self.edit_item is not None):
+                return
+            
+            # Only process left mouse button
+            if event.button != 1:
+                return
+            
+            # Must have valid drag start
+            if not self.drag_start_pos:
+                return
+            
+            if self.is_dragging:
+                # Box selection
+                # Allow releasing outside axes: clamp release point, then convert
+                sx, sy = self._clamp_pixel_to_axes(self.drag_start_pos[0], self.drag_start_pos[1])
+                ex, ey = self._clamp_pixel_to_axes(event.x, event.y)
+                start_data = self.pixel_to_data(sx, sy)
+                end_data = self.pixel_to_data(ex, ey)
+                
+                if start_data[0] is not None and end_data[0] is not None:
+                    # Find points in selection box
+                    selected_indices = self.find_points_in_box(start_data, end_data)
+                    
+                    # Update table selection
+                    if selected_indices:
+                        self.table.selection_remove(self.table.selection())
+                        children = self.table.get_children()
+                        for index in selected_indices:
+                            if 0 <= index < len(children):
+                                self.table.selection_add(children[index])
+                        # Update plot highlighting
+                        self._update_plot_internal(selected_indices)
+                    else:
+                        # Clear selection if no points found
+                        self.table.selection_remove(self.table.selection())
+                        self._update_plot_internal(None)
+            else:
+                # Single click - nearest point selection
+                # Clamp click location into axes to allow clicks near borders
+                cx, cy = self._clamp_pixel_to_axes(event.x, event.y)
+                # If clamped point is still outside axes (axes may not exist), bail
+                if cx is None or cy is None:
+                    return
+                nearest_index = self.find_nearest_point(cx, cy)
+                
+                if nearest_index is not None:
+                    # Select the nearest point in table
+                    self.table.selection_remove(self.table.selection())
+                    children = self.table.get_children()
+                    if 0 <= nearest_index < len(children):
+                        self.table.selection_add(children[nearest_index])
+                    # Update plot highlighting
+                    self._update_plot_internal([nearest_index])
+                else:
+                    # Clear selection if no point found within tolerance
+                    self.table.selection_remove(self.table.selection())
+                    self._update_plot_internal(None)
+            
+            # Clean up rectangle artist if present (it may already be gone after redraw)
+            if self.selection_rect:
+                try:
+                    self.selection_rect.remove()
+                except Exception:
+                    pass
+                finally:
+                    self.selection_rect = None
+                self.canvas.draw()
+            
+            self.drag_start_pos = None
+            self.is_dragging = False
+            
+        except Exception:
+            # Fail silently for robustness
+            # Clean up state
+            self.drag_start_pos = None
+            self.is_dragging = False
+            if self.selection_rect:
+                try:
+                    self.selection_rect.remove()
+                    self.selection_rect = None
+                    self.canvas.draw()
+                except:
+                    pass
+
+    def connect_plot_events(self):
+        """Connect matplotlib event handlers for plot selection"""
+        try:
+            # Disconnect any existing connections first
+            self.disconnect_plot_events()
+            
+            # Connect new event handlers
+            self.plot_event_connections['button_press'] = self.canvas.mpl_connect(
+                'button_press_event', self.on_plot_press)
+            self.plot_event_connections['motion_notify'] = self.canvas.mpl_connect(
+                'motion_notify_event', self.on_plot_motion)
+            self.plot_event_connections['button_release'] = self.canvas.mpl_connect(
+                'button_release_event', self.on_plot_release)
+        except Exception:
+            # Fail silently for robustness
+            pass
+
+    def disconnect_plot_events(self):
+        """Disconnect matplotlib event handlers for plot selection"""
+        try:
+            for event_type, connection_id in self.plot_event_connections.items():
+                if connection_id is not None:
+                    self.canvas.mpl_disconnect(connection_id)
+            self.plot_event_connections.clear()
+            
+            # Clean up any active selection state
+            if self.selection_rect:
+                self.selection_rect.remove()
+                self.selection_rect = None
+                self.canvas.draw()
+            
+            self.drag_start_pos = None
+            self.is_dragging = False
+        except Exception:
+            # Fail silently for robustness
+            pass
+
+    def find_nearest_point(self, pixel_x, pixel_y):
+        """Find the nearest point to pixel coordinates within tolerance"""
+        try:
+            if self.pwl_data.get_point_count() == 0:
+                return None
+            
+            times = self.pwl_data.timestamps
+            values = self.pwl_data.values
+            
+            nearest_index = None
+            min_distance = float('inf')
+            
+            for i, (time, value) in enumerate(zip(times, values)):
+                # Convert data point to pixel coordinates
+                px, py = self.data_to_pixel(time, value)
+                if px is None or py is None:
+                    continue
+                
+                # Calculate pixel distance
+                distance = ((pixel_x - px)**2 + (pixel_y - py)**2)**0.5
+                
+                if distance < min_distance and distance <= self.NEAREST_PX_TOL:
+                    min_distance = distance
+                    nearest_index = i
+            
+            return nearest_index
+        except Exception:
+            return None
+
+    def find_points_in_box(self, start_data, end_data):
+        """Find all points within the selection box"""
+        try:
+            if self.pwl_data.get_point_count() == 0:
+                return []
+            
+            # Ensure proper box bounds (min/max)
+            min_time = min(start_data[0], end_data[0])
+            max_time = max(start_data[0], end_data[0])
+            min_value = min(start_data[1], end_data[1])
+            max_value = max(start_data[1], end_data[1])
+            
+            times = self.pwl_data.timestamps
+            values = self.pwl_data.values
+            
+            selected_indices = []
+            for i, (time, value) in enumerate(zip(times, values)):
+                # Check if point is within the selection box
+                if (min_time <= time <= max_time and 
+                    min_value <= value <= max_value):
+                    selected_indices.append(i)
+            
+            return selected_indices
+        except Exception:
+            return []
+
+    def update_selection_rectangle(self, start_pixel, end_pixel):
+        """Update the visual selection rectangle during drag operations"""
+        try:
+            # Remove existing rectangle
+            if self.selection_rect:
+                self.selection_rect.remove()
+                self.selection_rect = None
+            
+            # Convert pixel coordinates to data coordinates for rectangle
+            start_data = self.pixel_to_data(start_pixel[0], start_pixel[1])
+            end_data = self.pixel_to_data(end_pixel[0], end_pixel[1])
+            
+            if start_data[0] is None or end_data[0] is None:
+                return
+            
+            # Calculate rectangle bounds
+            min_x = min(start_data[0], end_data[0])
+            max_x = max(start_data[0], end_data[0])
+            min_y = min(start_data[1], end_data[1])
+            max_y = max(start_data[1], end_data[1])
+            
+            # Create rectangle patch
+            from matplotlib.patches import Rectangle
+            rect_width = max_x - min_x
+            rect_height = max_y - min_y
+            
+            self.selection_rect = Rectangle(
+                (min_x, min_y), rect_width, rect_height,
+                linewidth=2, edgecolor='red', facecolor='red', alpha=0.2
+            )
+            
+            self.ax.add_patch(self.selection_rect)
+            self.canvas.draw()
+            
+        except Exception:
+            # Fail silently for robustness
+            pass
 
     def undo(self):
         """Undo last operation with comprehensive error handling and invalid text handling"""
