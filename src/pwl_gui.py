@@ -13,8 +13,14 @@ from pwl_parser import PwlData, PwlPoint
 from pwl_gui_geometry import PWLEditorGeometry
 from pwl_insertion import SmartInsertion
 from pwl_undo import UndoRedoManager
-import pwl_formatting as fmt
 from version import get_version
+from utils.plot_coordinates import data_to_pixel as util_data_to_pixel, pixel_to_data as util_pixel_to_data, clamp_pixel_to_axes as util_clamp
+from services.file_service import FileService
+from services.format_service import FormatService
+from services.document_service import DocumentService
+from controllers.plot_selection_controller import PlotSelectionController
+from controllers.table_controller import TableController
+from controllers.text_controller import TextController
 
 class PWLEditor:
     def __init__(self, root):
@@ -36,7 +42,8 @@ class PWLEditor:
         self.edit_column = None
         
         # Multi-selection preservation for editing
-        self.previous_selection = None  # Store the selection before current one
+        # Store the selection before current one (list of Treeview item IDs) or None
+        self.previous_selection = None
         
         # Plot-to-table selection constants and state
         self.NEAREST_PX_TOL = 10    # Pixel tolerance for nearest-point selection
@@ -48,6 +55,18 @@ class PWLEditor:
         
         # Initialize smart insertion handler
         self.smart_insertion = SmartInsertion()
+        # Initialize file service
+        self.file_service = FileService()
+        # Initialize plot selection controller (delegates event logic)
+        self.plot_controller = PlotSelectionController(self)
+        # Initialize format service
+        self.format_service = FormatService()
+        # Initialize table controller
+        self.table_controller = TableController(self)
+        # Initialize text controller
+        self.text_controller = TextController(self)
+        # Initialize document service
+        self.document_service = DocumentService(self)
         
         self.gui = PWLEditorGeometry(root, callback_handler=self)
         self.widgets = self.gui.get_all_widgets()
@@ -86,24 +105,15 @@ class PWLEditor:
     
     def get_examples_dir(self):
         """Get examples directory path for file dialogs"""
-        # Check if running as PyInstaller executable
-        if getattr(sys, 'frozen', False):
-            # Running as executable - get directory where executable is located
-            script_dir = os.path.dirname(sys.executable)
-        else:
-            # Running as Python script
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            # Go up one level for script (since we're in src/)
-            script_dir = os.path.dirname(script_dir)
-        
-        # Look for examples directory
-        examples_dir = os.path.join(script_dir, 'examples')
-        # Return examples dir if it exists, otherwise return script directory
-        return examples_dir if os.path.exists(examples_dir) else script_dir
+        # Delegate to service to avoid duplication
+        return self.file_service.get_examples_dir()
     
     def get_initial_dir(self):
         """Get initial directory for file dialogs - remember last used or default to examples"""
-        return self.last_directory if self.last_directory else self.get_examples_dir()
+        # Keep backward compatibility with existing last_directory state
+        if self.last_directory:
+            return self.last_directory
+        return self.file_service.get_initial_dir()
     
     @property
     def export_format_var(self):
@@ -120,6 +130,7 @@ class PWLEditor:
     @property
     def notebook(self):
         return self.gui.notebook
+
     def on_tab_changed(self, event):
         selected_tab = self.notebook.select()
         tab_text = self.notebook.tab(selected_tab, 'text')
@@ -138,40 +149,10 @@ class PWLEditor:
             self.table_to_text()
 
     def table_to_text(self):
-        try:
-            if self.export_format_var is not None:
-                self.table_to_text_with_format()
-            else:
-                # Use preserve_original=True by default to maintain original formatting
-                text_content = self.pwl_data.to_text_precise(use_relative_time=True, precision=9, preserve_original=True)
-                self.text_editor.delete(1.0, tk.END)
-                self.text_editor.insert(1.0, text_content)
-        except Exception as e:
-            self.status_var.set(f"Error updating text: {e}")
+        return self.text_controller.table_to_text()
 
     def text_to_table(self):
-        """Handle text-to-table conversion with proper undo integration"""
-        try:
-            text_content = self.text_editor.get(1.0, tk.END).strip()
-            if text_content:
-                new_pwl_data = PwlData()
-                if new_pwl_data.load_from_text(text_content):
-                    self._operation_description = "Text to table conversion"
-                    self.pwl_data = new_pwl_data
-                    self.update_table()
-                    self.update_plot()  # This will create the undo point
-                    self.mark_unsaved()
-                else:
-                    self.status_var.set("Invalid PWL text format")
-            else:
-                # Handle empty text - convert to empty data
-                self._operation_description = "Clear all data"
-                self.pwl_data = PwlData()
-                self.update_table()
-                self.update_plot()  # This will create the undo point
-                self.mark_unsaved()
-        except Exception as e:
-            self.status_var.set(f"Error parsing text: {e}")
+        return self.text_controller.text_to_table()
 
     def update_table(self):
         for item in self.table.get_children():
@@ -202,53 +183,16 @@ class PWLEditor:
         self.status_var.set(f"Loaded {self.pwl_data.get_point_count()} points")
 
     def on_table_select(self, event=None):
-        """Handle table selection and highlight corresponding points in plot"""
-        try:
-            selected_items = self.table.selection()
-            current_selection = list(selected_items) if selected_items else []
-            
-            # Only update previous_selection if this is a "real" selection change
-            # (not a temporary change during double-click sequence)
-            # We detect double-click interference by checking if the new selection
-            # is a single item that was part of the previous multi-selection
-            if current_selection:
-                should_update_previous = True
-                
-                # If we have a previous multi-selection and current is single item from that selection,
-                # this might be a double-click sequence - don't update previous_selection
-                if (self.previous_selection and len(self.previous_selection) > 1 and 
-                    len(current_selection) == 1 and current_selection[0] in self.previous_selection):
-                    should_update_previous = False
-                
-                if should_update_previous:
-                    self.previous_selection = current_selection
-            
-            # Get the indices of all selected items for plot highlighting
-            selected_indices = []
-            if selected_items:
-                children = self.table.get_children()
-                for item in selected_items:
-                    if item in children:
-                        selected_indices.append(children.index(item))
-            
-            # Update plot with highlighting (pass list of indices or None)
-            self._update_plot_internal(selected_indices if selected_indices else None)
-            
-        except Exception as e:
-            # Fail silently - highlighting is a nice-to-have feature
-            pass
+        """Delegate to TableController"""
+        return self.table_controller.on_table_select(event)
 
     def _smart_time_format(self, time_value, reference_point=None):
-        """Delegate to shared formatting to preserve style from a reference when available."""
-        if reference_point and hasattr(reference_point, 'time_str'):
-            return fmt.format_like_reference(time_value, reference_point.time_str)
-        return fmt.suggest_optimal(time_value)
+        """Delegate to FormatService to preserve style from a reference when available."""
+        return self.format_service.format_time(time_value, reference_point)
 
     def _smart_value_format(self, value, reference_point=None):
-        """Delegate to shared formatting to preserve style from a reference when available."""
-        if reference_point and hasattr(reference_point, 'value_str'):
-            return fmt.format_like_reference(value, reference_point.value_str)
-        return fmt.suggest_optimal(value)
+        """Delegate to FormatService to preserve style from a reference when available."""
+        return self.format_service.format_value(value, reference_point)
     
     def update_plot(self, selected_indices=None):
         """Update plot and create undo point"""
@@ -269,9 +213,13 @@ class PWLEditor:
         """Internal plot update without undo point creation"""
         # Clear plot (this also removes any existing patches)
         self.ax.clear()
-        # Any previously stored selection rectangle reference is now invalid
-        # Ensure we don't try to remove a stale artist later
-        self.selection_rect = None
+        # Any previously stored selection rectangle reference is now invalid.
+        # Ask controller to clear it to keep internal/editor state in sync.
+        try:
+            self.plot_controller.clear_selection_rect()
+        except Exception:
+            # Fallback to clearing the attribute if controller isn't available
+            self.selection_rect = None
         
         if self.pwl_data.get_point_count() > 0:
             times = self.pwl_data.timestamps
@@ -335,10 +283,7 @@ class PWLEditor:
         try:
             if not self.ax or self.pwl_data.get_point_count() == 0:
                 return None, None
-            
-            # Use matplotlib transform to convert data to pixel coordinates
-            pixel_coords = self.ax.transData.transform([(data_x, data_y)])
-            return pixel_coords[0][0], pixel_coords[0][1]
+            return util_data_to_pixel(self.ax, data_x, data_y)
         except Exception:
             return None, None
 
@@ -347,323 +292,48 @@ class PWLEditor:
         try:
             if not self.ax or self.pwl_data.get_point_count() == 0:
                 return None, None
-            
-            # Use matplotlib transform to convert pixel to data coordinates
-            data_coords = self.ax.transData.inverted().transform([(pixel_x, pixel_y)])
-            return data_coords[0][0], data_coords[0][1]
+            return util_pixel_to_data(self.ax, pixel_x, pixel_y)
         except Exception:
             return None, None
 
     def _clamp_pixel_to_axes(self, px, py):
         """Clamp pixel coordinates to the axes bounding box to support border drags."""
         try:
-            if not self.ax:
-                return px, py
-            # axes bbox in display (pixel) coords
-            bbox = self.ax.get_window_extent()
-            clamped_x = min(max(px, bbox.x0), bbox.x1)
-            clamped_y = min(max(py, bbox.y0), bbox.y1)
-            return clamped_x, clamped_y
+            return util_clamp(self.ax, px, py)
         except Exception:
             return px, py
 
     def on_plot_press(self, event):
-        """Handle mouse press on plot for selection"""
-        try:
-            # Only process in Table mode
-            selected_tab = self.notebook.select()
-            tab_text = self.notebook.tab(selected_tab, 'text')
-            if tab_text != 'Table':
-                return
-            
-            # Ignore if inline editing is active
-            if (self.edit_entry is not None or self.edit_combo is not None or 
-                self.edit_item is not None):
-                return
-            
-            # Only process left mouse button
-            if event.button != 1:
-                return
-            
-            # Clear any existing selection rectangle (be robust if already cleared)
-            if self.selection_rect:
-                try:
-                    self.selection_rect.remove()
-                except Exception:
-                    pass
-                finally:
-                    self.selection_rect = None
-                self.canvas.draw()
-            
-            # Store drag start position (pixel coordinates), clamped to axes
-            sx, sy = self._clamp_pixel_to_axes(event.x, event.y)
-            self.drag_start_pos = (sx, sy)
-            self.is_dragging = False
-            
-        except Exception:
-            # Fail silently for robustness
-            pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.on_plot_press(event)
 
     def on_plot_motion(self, event):
-        """Handle mouse motion on plot for drag selection"""
-        try:
-            # Only process in Table mode
-            selected_tab = self.notebook.select()
-            tab_text = self.notebook.tab(selected_tab, 'text')
-            if tab_text != 'Table':
-                return
-            
-            # Ignore if inline editing is active
-            if (self.edit_entry is not None or self.edit_combo is not None or 
-                self.edit_item is not None):
-                return
-            
-            # Must have started drag; allow moves outside axes (we'll clamp)
-            if not self.drag_start_pos:
-                return
-            
-            # Calculate drag distance
-            dx = event.x - self.drag_start_pos[0]
-            dy = event.y - self.drag_start_pos[1]
-            drag_distance = (dx*dx + dy*dy)**0.5
-            
-            # Start dragging if threshold exceeded
-            if drag_distance >= self.DRAG_THRESHOLD_PX:
-                self.is_dragging = True
-                
-                # Update selection rectangle
-                # Clamp current point to axes to keep rectangle visible at borders
-                cx, cy = self._clamp_pixel_to_axes(event.x, event.y)
-                self.update_selection_rectangle(self.drag_start_pos, (cx, cy))
-            
-        except Exception:
-            # Fail silently for robustness
-            pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.on_plot_motion(event)
 
     def on_plot_release(self, event):
-        """Handle mouse release on plot for selection completion"""
-        try:
-            # Only process in Table mode
-            selected_tab = self.notebook.select()
-            tab_text = self.notebook.tab(selected_tab, 'text')
-            if tab_text != 'Table':
-                return
-            
-            # Ignore if inline editing is active
-            if (self.edit_entry is not None or self.edit_combo is not None or 
-                self.edit_item is not None):
-                return
-            
-            # Only process left mouse button
-            if event.button != 1:
-                return
-            
-            # Must have valid drag start
-            if not self.drag_start_pos:
-                return
-            
-            if self.is_dragging:
-                # Box selection
-                # Allow releasing outside axes: clamp release point, then convert
-                sx, sy = self._clamp_pixel_to_axes(self.drag_start_pos[0], self.drag_start_pos[1])
-                ex, ey = self._clamp_pixel_to_axes(event.x, event.y)
-                start_data = self.pixel_to_data(sx, sy)
-                end_data = self.pixel_to_data(ex, ey)
-                
-                if start_data[0] is not None and end_data[0] is not None:
-                    # Find points in selection box
-                    selected_indices = self.find_points_in_box(start_data, end_data)
-                    
-                    # Update table selection
-                    if selected_indices:
-                        self.table.selection_remove(self.table.selection())
-                        children = self.table.get_children()
-                        for index in selected_indices:
-                            if 0 <= index < len(children):
-                                self.table.selection_add(children[index])
-                        # Update plot highlighting
-                        self._update_plot_internal(selected_indices)
-                    else:
-                        # Clear selection if no points found
-                        self.table.selection_remove(self.table.selection())
-                        self._update_plot_internal(None)
-            else:
-                # Single click - nearest point selection
-                # Clamp click location into axes to allow clicks near borders
-                cx, cy = self._clamp_pixel_to_axes(event.x, event.y)
-                # If clamped point is still outside axes (axes may not exist), bail
-                if cx is None or cy is None:
-                    return
-                nearest_index = self.find_nearest_point(cx, cy)
-                
-                if nearest_index is not None:
-                    # Select the nearest point in table
-                    self.table.selection_remove(self.table.selection())
-                    children = self.table.get_children()
-                    if 0 <= nearest_index < len(children):
-                        self.table.selection_add(children[nearest_index])
-                    # Update plot highlighting
-                    self._update_plot_internal([nearest_index])
-                else:
-                    # Clear selection if no point found within tolerance
-                    self.table.selection_remove(self.table.selection())
-                    self._update_plot_internal(None)
-            
-            # Clean up rectangle artist if present (it may already be gone after redraw)
-            if self.selection_rect:
-                try:
-                    self.selection_rect.remove()
-                except Exception:
-                    pass
-                finally:
-                    self.selection_rect = None
-                self.canvas.draw()
-            
-            self.drag_start_pos = None
-            self.is_dragging = False
-            
-        except Exception:
-            # Fail silently for robustness
-            # Clean up state
-            self.drag_start_pos = None
-            self.is_dragging = False
-            if self.selection_rect:
-                try:
-                    self.selection_rect.remove()
-                    self.selection_rect = None
-                    self.canvas.draw()
-                except:
-                    pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.on_plot_release(event)
 
     def connect_plot_events(self):
-        """Connect matplotlib event handlers for plot selection"""
-        try:
-            # Disconnect any existing connections first
-            self.disconnect_plot_events()
-            
-            # Connect new event handlers
-            self.plot_event_connections['button_press'] = self.canvas.mpl_connect(
-                'button_press_event', self.on_plot_press)
-            self.plot_event_connections['motion_notify'] = self.canvas.mpl_connect(
-                'motion_notify_event', self.on_plot_motion)
-            self.plot_event_connections['button_release'] = self.canvas.mpl_connect(
-                'button_release_event', self.on_plot_release)
-        except Exception:
-            # Fail silently for robustness
-            pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.connect_plot_events()
 
     def disconnect_plot_events(self):
-        """Disconnect matplotlib event handlers for plot selection"""
-        try:
-            for event_type, connection_id in self.plot_event_connections.items():
-                if connection_id is not None:
-                    self.canvas.mpl_disconnect(connection_id)
-            self.plot_event_connections.clear()
-            
-            # Clean up any active selection state
-            if self.selection_rect:
-                self.selection_rect.remove()
-                self.selection_rect = None
-                self.canvas.draw()
-            
-            self.drag_start_pos = None
-            self.is_dragging = False
-        except Exception:
-            # Fail silently for robustness
-            pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.disconnect_plot_events()
 
     def find_nearest_point(self, pixel_x, pixel_y):
-        """Find the nearest point to pixel coordinates within tolerance"""
-        try:
-            if self.pwl_data.get_point_count() == 0:
-                return None
-            
-            times = self.pwl_data.timestamps
-            values = self.pwl_data.values
-            
-            nearest_index = None
-            min_distance = float('inf')
-            
-            for i, (time, value) in enumerate(zip(times, values)):
-                # Convert data point to pixel coordinates
-                px, py = self.data_to_pixel(time, value)
-                if px is None or py is None:
-                    continue
-                
-                # Calculate pixel distance
-                distance = ((pixel_x - px)**2 + (pixel_y - py)**2)**0.5
-                
-                if distance < min_distance and distance <= self.NEAREST_PX_TOL:
-                    min_distance = distance
-                    nearest_index = i
-            
-            return nearest_index
-        except Exception:
-            return None
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.find_nearest_point(pixel_x, pixel_y)
 
     def find_points_in_box(self, start_data, end_data):
-        """Find all points within the selection box"""
-        try:
-            if self.pwl_data.get_point_count() == 0:
-                return []
-            
-            # Ensure proper box bounds (min/max)
-            min_time = min(start_data[0], end_data[0])
-            max_time = max(start_data[0], end_data[0])
-            min_value = min(start_data[1], end_data[1])
-            max_value = max(start_data[1], end_data[1])
-            
-            times = self.pwl_data.timestamps
-            values = self.pwl_data.values
-            
-            selected_indices = []
-            for i, (time, value) in enumerate(zip(times, values)):
-                # Check if point is within the selection box
-                if (min_time <= time <= max_time and 
-                    min_value <= value <= max_value):
-                    selected_indices.append(i)
-            
-            return selected_indices
-        except Exception:
-            return []
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.find_points_in_box(start_data, end_data)
 
     def update_selection_rectangle(self, start_pixel, end_pixel):
-        """Update the visual selection rectangle during drag operations"""
-        try:
-            # Remove existing rectangle
-            if self.selection_rect:
-                self.selection_rect.remove()
-                self.selection_rect = None
-            
-            # Convert pixel coordinates to data coordinates for rectangle
-            start_data = self.pixel_to_data(start_pixel[0], start_pixel[1])
-            end_data = self.pixel_to_data(end_pixel[0], end_pixel[1])
-            
-            if start_data[0] is None or end_data[0] is None:
-                return
-            
-            # Calculate rectangle bounds
-            min_x = min(start_data[0], end_data[0])
-            max_x = max(start_data[0], end_data[0])
-            min_y = min(start_data[1], end_data[1])
-            max_y = max(start_data[1], end_data[1])
-            
-            # Create rectangle patch
-            from matplotlib.patches import Rectangle
-            rect_width = max_x - min_x
-            rect_height = max_y - min_y
-            
-            self.selection_rect = Rectangle(
-                (min_x, min_y), rect_width, rect_height,
-                linewidth=2, edgecolor='red', facecolor='red', alpha=0.2
-            )
-            
-            self.ax.add_patch(self.selection_rect)
-            self.canvas.draw()
-            
-        except Exception:
-            # Fail silently for robustness
-            pass
+        """Delegate to PlotSelectionController"""
+        return self.plot_controller.update_selection_rectangle(start_pixel, end_pixel)
 
     def undo(self):
         """Undo last operation with comprehensive error handling and invalid text handling"""
@@ -875,12 +545,13 @@ class PWLEditor:
             
             # Restore previous multi-selection
             self.table.selection_remove(self.table.selection())
-            for item in self.previous_selection:
+            prev_sel = list(self.previous_selection) if self.previous_selection else []
+            for item in prev_sel:
                 try:
                     self.table.selection_add(item)
                 except:
                     pass
-            selected_items = list(self.previous_selection)
+            selected_items = prev_sel
             # Clear previous_selection after using it to prevent confusion in next cycle
             self.previous_selection = None
         else:
@@ -1074,7 +745,7 @@ class PWLEditor:
                                 delta = curr_abs_time - prev_abs_time
                                 
                                 # Preserve the original notation style for delta
-                                delta_str = fmt.format_like_reference(delta, current_point.time_str)
+                                delta_str = self.format_service.format_time(delta, current_point)
                                 current_point.update_time_str(delta_str)
                             else:
                                 # First point can't be relative, skip this item
@@ -1085,7 +756,7 @@ class PWLEditor:
                         else:
                             # Converting REL → ABS: store absolute time preserving format style
                             abs_time = self.pwl_data.get_absolute_time(index)
-                            abs_time_str = fmt.format_like_reference(abs_time, current_point.time_str)
+                            abs_time_str = self.format_service.format_time(abs_time, current_point)
                             current_point.update_time_str(abs_time_str)
                         
                         current_point.is_relative = is_relative
@@ -1144,7 +815,7 @@ class PWLEditor:
                             prev_abs_time = self.pwl_data.get_absolute_time(index - 1)
                             curr_abs_time = self.pwl_data.get_absolute_time(index)
                             delta = curr_abs_time - prev_abs_time
-                            delta_str = fmt.format_like_reference(delta, current_point.time_str)
+                            delta_str = self.format_service.format_time(delta, current_point)
                             current_point.update_time_str(delta_str)
                         else:
                             # First point cannot be relative
@@ -1154,7 +825,7 @@ class PWLEditor:
                     else:
                         # Converting REL → ABS
                         abs_time = self.pwl_data.get_absolute_time(index)
-                        abs_time_str = fmt.format_like_reference(abs_time, current_point.time_str)
+                        abs_time_str = self.format_service.format_time(abs_time, current_point)
                         current_point.update_time_str(abs_time_str)
 
                     current_point.is_relative = is_relative
@@ -1295,63 +966,13 @@ class PWLEditor:
                 self.table.selection_add(self.table.get_children()[i + 1])
 
     def on_export_format_changed(self, event=None):
-        """Handle export format dropdown change - store setting but don't apply immediately"""
-        # Just store the setting, don't update text editor immediately
-        # The format will be applied when saving
-        selected_format = self.export_format_var.get()
-        self.status_var.set(f"Export format set to: {selected_format} (applies on save)")
+        return self.text_controller.on_export_format_changed(event)
     
     def table_to_text_with_format(self):
-        """Update text editor using the selected export format"""
-        try:
-            # Map display names to format codes
-            format_map = {
-                "Preserve Mixed": "preserve_mixed",
-                "Force Relative": "force_relative", 
-                "Force Absolute": "force_absolute"
-            }
-            
-            selected_format = format_map.get(self.export_format_var.get(), "preserve_mixed")
-            # Use preserve_original=True by default to maintain original formatting
-            text_content = self.pwl_data.to_text_with_format(export_format=selected_format, precision=9, preserve_original=True)
-            
-            self.text_editor.delete(1.0, tk.END)
-            self.text_editor.insert(1.0, text_content)
-        except Exception as e:
-            self.status_var.set(f"Error updating text format: {e}")
+        return self.text_controller.table_to_text_with_format()
     
     def _get_formatted_content_for_save(self):
-        """Get content formatted according to export format setting for saving"""
-        try:
-            # First ensure data is synchronized from text editor
-            self.text_to_table()
-            
-            # Map display names to format codes
-            format_map = {
-                "Preserve Mixed": "preserve_mixed",
-                "Force Relative": "force_relative", 
-                "Force Absolute": "force_absolute"
-            }
-            
-            selected_format = format_map.get(self.export_format_var.get(), "preserve_mixed")
-            
-            # Apply the selected export format
-            if selected_format == "preserve_mixed":
-                # Use current text editor content as-is
-                return self.text_editor.get(1.0, tk.END).strip()
-            else:
-                # Apply the selected format transformation
-                formatted_content = self.pwl_data.to_text_with_format(
-                    export_format=selected_format, 
-                    precision=9, 
-                    preserve_original=True
-                )
-                return formatted_content.strip()
-                
-        except Exception as e:
-            self.status_var.set(f"Error formatting content for save: {e}")
-            # Fallback to current text editor content
-            return self.text_editor.get(1.0, tk.END).strip()
+        return self.text_controller.get_formatted_content_for_save()
 
     def sort_data(self):
         """Sort data points by time"""
@@ -1376,11 +997,11 @@ class PWLEditor:
 
     def _format_si_prefix(self, value):
         """Use shared SI formatting."""
-        return fmt.format_si(value)
+        return self.format_service.format_si(value)
     
     def _format_scientific(self, value):
         """Use shared engineering-style scientific formatting."""
-        return fmt.format_engineering(value)
+        return self.format_service.format_engineering(value)
 
     def convert_time_to_si(self):
         """Convert time values to SI prefix notation"""
@@ -1534,128 +1155,20 @@ class PWLEditor:
             self.status_var.set(f"Error restoring original formatting: {e}")
 
     def new_file(self):
-        """Create new file - handle undo history appropriately"""
-        if self.check_unsaved_changes():
-            self.pwl_data.clear()
-            self.current_file = None
-            
-            # Update views WITHOUT creating undo points
-            self._undo_in_progress = True
-            try:
-                self.update_table()
-                self._update_plot_internal()  # Use internal method to avoid undo point
-                self.table_to_text()
-                self.unsaved_changes = False
-                self.update_title()
-                self.status_var.set("New file created")
-            finally:
-                self._undo_in_progress = False
-            
-            # Clear undo history AFTER clearing data and establish new baseline
-            if hasattr(self, 'undo_manager'):
-                self.undo_manager.clear_history()
-                self.undo_manager.save_state(self.pwl_data, "New file")
+        """Create new file - delegate to DocumentService"""
+        return self.document_service.new_file()
 
     def open_file(self):
-        """Open PWL file - handle undo history appropriately"""
-        if not self.check_unsaved_changes():
-            return
-        
-        file_path = filedialog.askopenfilename(
-            title="Open PWL File",
-            initialdir=self.get_initial_dir(),
-            filetypes=[("PWL/Text Files", "*.pwl;*.txt"), ("PWL Files", "*.pwl"), ("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        
-        if file_path:
-            try:
-                # Remember the directory for next time
-                self.last_directory = os.path.dirname(file_path)
-                
-                new_pwl_data = PwlData()
-                if new_pwl_data.load_from_file(file_path, 0.001):  # Default 1ms timestep
-                    self.pwl_data = new_pwl_data
-                    self.current_file = file_path
-                    
-                    # Update views WITHOUT creating undo points
-                    self._undo_in_progress = True
-                    try:
-                        self.update_table()
-                        self._update_plot_internal()  # Use internal method to avoid undo point
-                        self.table_to_text()
-                        self.unsaved_changes = False
-                        self.update_title()
-                        self.status_var.set(f"Loaded: {os.path.basename(file_path)}")
-                    finally:
-                        self._undo_in_progress = False
-                    
-                    # Clear undo history AFTER loading file and establish new baseline
-                    if hasattr(self, 'undo_manager'):
-                        self.undo_manager.clear_history()
-                        self.undo_manager.save_state(self.pwl_data, f"Opened: {os.path.basename(file_path)}")
-                else:
-                    messagebox.showerror("Error", "Failed to load PWL file")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to open file: {e}")
+        """Open PWL file - delegate to DocumentService"""
+        return self.document_service.open_file()
 
     def save_file(self):
-        """Save current file with confirmation"""
-        if self.current_file:
-            # Ask for confirmation when overwriting existing file
-            if os.path.exists(self.current_file):
-                result = messagebox.askyesno(
-                    "Confirm Save", 
-                    f"Overwrite existing file?\n\n{os.path.basename(self.current_file)}",
-                    icon='question'
-                )
-                if not result:
-                    return
-            
-            try:
-                # Apply export format setting when saving
-                text_content = self._get_formatted_content_for_save()
-                if text_content:
-                    with open(self.current_file, 'w') as f:
-                        f.write(text_content)
-                    
-                    self.unsaved_changes = False
-                    self.update_title()
-                    self.status_var.set(f"Saved: {os.path.basename(self.current_file)}")
-                else:
-                    messagebox.showwarning("Save Warning", "No content to save")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save file: {e}")
-        else:
-            self.save_file_as()
+        """Save current file with confirmation - delegate to DocumentService"""
+        return self.document_service.save_file()
 
     def save_file_as(self):
-        """Save file with new name"""
-        file_path = filedialog.asksaveasfilename(
-            title="Save PWL File",
-            initialdir=self.get_initial_dir(),
-            defaultextension=".pwl",
-            filetypes=[("PWL/Text Files", "*.pwl;*.txt"), ("PWL Files", "*.pwl"), ("Text Files", "*.txt"), ("All Files", "*.*")]
-        )
-        
-        if file_path:
-            try:
-                # Remember the directory for next time
-                self.last_directory = os.path.dirname(file_path)
-                
-                # Apply export format setting when saving
-                text_content = self._get_formatted_content_for_save()
-                if text_content:
-                    with open(file_path, 'w') as f:
-                        f.write(text_content)
-                    
-                    self.current_file = file_path
-                    self.unsaved_changes = False
-                    self.update_title()
-                    self.status_var.set(f"Saved: {os.path.basename(file_path)}")
-                else:
-                    messagebox.showwarning("Save Warning", "No content to save")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save file: {e}")
+        """Save file with new name - delegate to DocumentService"""
+        return self.document_service.save_file_as()
 
     def on_text_changed(self, event):
         """Handle text editor changes with real-time validation"""
