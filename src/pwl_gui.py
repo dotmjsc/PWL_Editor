@@ -9,14 +9,16 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
 import sys
+from types import SimpleNamespace
+from typing import Sequence
 from pwl_parser import PwlData, PwlPoint
 from pwl_gui_geometry import PWLEditorGeometry
-from pwl_insertion import SmartInsertion
-from pwl_undo import UndoRedoManager
-from version import get_version
+from services.insertion_service import SmartInsertion
+from services.undo_history import UndoRedoManager
+from version import get_version, get_version_info
 from utils.plot_coordinates import data_to_pixel as util_data_to_pixel, pixel_to_data as util_pixel_to_data, clamp_pixel_to_axes as util_clamp
 from services.file_service import FileService
-from services.format_service import FormatService
+from services.formatting import FormatService
 from services.document_service import DocumentService
 from controllers.plot_selection_controller import PlotSelectionController
 from controllers.table_controller import TableController
@@ -70,6 +72,13 @@ class PWLEditor:
         
         self.gui = PWLEditorGeometry(root, callback_handler=self)
         self.widgets = self.gui.get_all_widgets()
+
+        # Ensure export formatting dropdown reflects a known default
+        try:
+            self.text_controller.initialize_export_format_default()
+        except Exception:
+            # Non-fatal during startup; status messaging will surface if used
+            pass
         
         self.update_title()
         self.update_plot()
@@ -114,6 +123,22 @@ class PWLEditor:
         if self.last_directory:
             return self.last_directory
         return self.file_service.get_initial_dir()
+
+    def show_about_dialog(self):
+        """Display an About dialog with build metadata."""
+        info = get_version_info()
+        version = info.get('version', get_version())
+        build_date = info.get('build_date', "")
+        repo_url = info.get('repo_url', "")
+
+        lines = [f"PWL Editor v{version}"]
+        if build_date:
+            lines.append(f"Build date: {build_date}")
+        if repo_url:
+            lines.append("")
+            lines.append(repo_url)
+
+        messagebox.showinfo("About PWL Editor", "\n".join(lines))
     
     @property
     def export_format_var(self):
@@ -193,6 +218,87 @@ class PWLEditor:
     def _smart_value_format(self, value, reference_point=None):
         """Delegate to FormatService to preserve style from a reference when available."""
         return self.format_service.format_value(value, reference_point)
+
+    def _get_selected_point_indices(self) -> list[int]:
+        try:
+            selected_items = self.table.selection()
+        except Exception:
+            return []
+        if not selected_items:
+            return []
+        children = self.table.get_children()
+        indices: list[int] = []
+        for item in selected_items:
+            if item in children:
+                indices.append(children.index(item))
+        indices.sort()
+        return indices
+
+    def select_all_points(self, event=None):
+        """Select all rows in the table view."""
+        try:
+            children = self.table.get_children()
+        except Exception:
+            return "break"
+        if not children:
+            return "break"
+        self.table.selection_set(children)
+        self.table.focus(children[0])
+        return "break"
+
+    def _reselect_table_indices(self, indices: list[int]):
+        if not indices:
+            return
+        try:
+            children = self.table.get_children()
+            items = [children[i] for i in indices if 0 <= i < len(children)]
+            if items:
+                self.table.selection_set(items)
+                self.table.focus(items[0])
+        except Exception:
+            pass
+
+    def _apply_time_representation(
+        self,
+        pwl_data: PwlData,
+        index: int,
+        *,
+        make_relative: bool,
+        allow_first_point_relative: bool = False,
+        reference_time_str: str | None = None,
+        absolute_times: Sequence[float] | None = None,
+    ) -> bool:
+        """Convert a single point to relative/absolute while mirroring existing formatting."""
+        if index < 0 or index >= pwl_data.get_point_count():
+            return False
+
+        point = pwl_data.points[index]
+        reference_str = reference_time_str if reference_time_str is not None else point.time_str
+        reference_point = SimpleNamespace(time_str=reference_str)
+
+        if make_relative:
+            if index == 0 and not allow_first_point_relative:
+                return False
+            if absolute_times is not None:
+                current_abs = absolute_times[index]
+                previous_abs = absolute_times[index - 1] if index > 0 else 0.0
+            else:
+                current_abs = pwl_data.get_absolute_time(index)
+                previous_abs = pwl_data.get_absolute_time(index - 1) if index > 0 else 0.0
+            delta = current_abs - previous_abs
+            formatted_time = self.format_service.format_time(delta, reference_point)
+            point.update_time_str(formatted_time)
+            point.is_relative = True
+        else:
+            if absolute_times is not None:
+                current_abs = absolute_times[index]
+            else:
+                current_abs = pwl_data.get_absolute_time(index)
+            formatted_time = self.format_service.format_time(current_abs, reference_point)
+            point.update_time_str(formatted_time)
+            point.is_relative = False
+
+        return True
     
     def update_plot(self, selected_indices=None):
         """Update plot and create undo point"""
@@ -245,8 +351,8 @@ class PWLEditor:
                     
                     i = j
                 
-                self.ax.plot(plot_times, plot_values, 'bo-', markersize=4, linewidth=1.5, label='PWL Points')
-                self.ax.plot(times, values, 'ro', markersize=6, alpha=0.7, label='Data Points')
+                self.ax.plot(plot_times, plot_values, 'bo-', markersize=4, linewidth=1.5)
+                self.ax.plot(times, values, 'ro', markersize=6, alpha=0.7)
                 
                 # Highlight selected points if specified
                 if selected_indices is not None and len(selected_indices) > 0:
@@ -258,11 +364,15 @@ class PWLEditor:
                             selected_values.append(values[index])
                     
                     if selected_times:
-                        self.ax.plot(selected_times, selected_values, 'yo', markersize=10, 
-                                   markeredgecolor='red', markeredgewidth=2, alpha=0.8, 
-                                   label=f'Selected Points ({len(selected_times)})')
-            
-            self.ax.legend()
+                        self.ax.plot(
+                            selected_times,
+                            selected_values,
+                            'yo',
+                            markersize=10,
+                            markeredgecolor='red',
+                            markeredgewidth=2,
+                            alpha=0.8,
+                        )
             
             if len(times) > 0:
                 time_margin = (max(times) - min(times)) * 0.05 if len(times) > 1 else 0.1
@@ -737,29 +847,20 @@ class PWLEditor:
                     current_point = self.pwl_data.points[index]
                     
                     if current_point.is_relative != is_relative:
-                        if is_relative:
-                            # Converting ABS → REL: calculate delta and preserve format style
-                            if index > 0:
-                                prev_abs_time = self.pwl_data.get_absolute_time(index - 1)
-                                curr_abs_time = self.pwl_data.get_absolute_time(index)
-                                delta = curr_abs_time - prev_abs_time
-                                
-                                # Preserve the original notation style for delta
-                                delta_str = self.format_service.format_time(delta, current_point)
-                                current_point.update_time_str(delta_str)
-                            else:
-                                # First point can't be relative, skip this item
-                                if len(selected_items) == 1:
-                                    messagebox.showwarning("Invalid Conversion", 
-                                                         "First point cannot be relative time. Keeping as absolute.")
-                                continue
-                        else:
-                            # Converting REL → ABS: store absolute time preserving format style
-                            abs_time = self.pwl_data.get_absolute_time(index)
-                            abs_time_str = self.format_service.format_time(abs_time, current_point)
-                            current_point.update_time_str(abs_time_str)
-                        
-                        current_point.is_relative = is_relative
+                        original_time_str = current_point.time_str
+                        converted = self._apply_time_representation(
+                            self.pwl_data,
+                            index,
+                            make_relative=is_relative,
+                            reference_time_str=original_time_str,
+                        )
+                        if not converted:
+                            if len(selected_items) == 1:
+                                messagebox.showwarning(
+                                    "Invalid Conversion",
+                                    "First point cannot be relative time. Keeping as absolute.",
+                                )
+                            continue
             
             # Clean up edit widgets
             if self.edit_entry:
@@ -809,26 +910,20 @@ class PWLEditor:
                 current_point = self.pwl_data.points[index]
 
                 if current_point.is_relative != is_relative:
-                    if is_relative:
-                        # Converting ABS → REL
-                        if index > 0:
-                            prev_abs_time = self.pwl_data.get_absolute_time(index - 1)
-                            curr_abs_time = self.pwl_data.get_absolute_time(index)
-                            delta = curr_abs_time - prev_abs_time
-                            delta_str = self.format_service.format_time(delta, current_point)
-                            current_point.update_time_str(delta_str)
-                        else:
-                            # First point cannot be relative
-                            if len(selected_items) == 1:
-                                messagebox.showwarning("Invalid Conversion", "First point cannot be relative time. Keeping as absolute.")
-                            continue
-                    else:
-                        # Converting REL → ABS
-                        abs_time = self.pwl_data.get_absolute_time(index)
-                        abs_time_str = self.format_service.format_time(abs_time, current_point)
-                        current_point.update_time_str(abs_time_str)
-
-                    current_point.is_relative = is_relative
+                    original_time_str = current_point.time_str
+                    converted = self._apply_time_representation(
+                        self.pwl_data,
+                        index,
+                        make_relative=is_relative,
+                        reference_time_str=original_time_str,
+                    )
+                    if not converted:
+                        if len(selected_items) == 1:
+                            messagebox.showwarning(
+                                "Invalid Conversion",
+                                "First point cannot be relative time. Keeping as absolute.",
+                            )
+                        continue
 
             # Cleanup any active editors
             if self.edit_entry:
@@ -971,8 +1066,94 @@ class PWLEditor:
     def table_to_text_with_format(self):
         return self.text_controller.table_to_text_with_format()
     
-    def _get_formatted_content_for_save(self):
-        return self.text_controller.get_formatted_content_for_save()
+    def _get_formatted_content_for_save(self, apply_export_format: bool = True):
+        return self.text_controller.get_formatted_content_for_save(apply_export_format=apply_export_format)
+
+    def generate_square_wave(self):
+        """Open the square wave generator dialog and merge the result if applied."""
+        try:
+            from dialogs.square_wave_dialog import SquareWaveGeneratorDialog
+        except ImportError as exc:
+            messagebox.showerror("Generate Square Wave", f"Failed to load generator dialog: {exc}")
+            return
+
+        dialog = SquareWaveGeneratorDialog(self)
+        generated_data = dialog.show()
+        if generated_data is None:
+            return
+
+        self._operation_description = "Generate square wave"
+        self.pwl_data = generated_data
+        self.update_table()
+        self.table_to_text_with_format()
+        self.update_plot()
+        self.mark_unsaved()
+
+    def generate_triangle_wave(self):
+        """Open the triangle wave generator dialog and merge the result if applied."""
+        try:
+            from dialogs.triangle_wave_dialog import TriangleWaveGeneratorDialog
+        except ImportError as exc:
+            messagebox.showerror("Generate Triangle Wave", f"Failed to load generator dialog: {exc}")
+            return
+
+        dialog = TriangleWaveGeneratorDialog(self)
+        generated_data = dialog.show()
+        if generated_data is None:
+            return
+
+        self._operation_description = "Generate triangle wave"
+        self.pwl_data = generated_data
+        self.update_table()
+        self.table_to_text_with_format()
+        self.update_plot()
+        self.mark_unsaved()
+
+    def generate_saw_wave(self):
+        """Open the saw wave generator dialog and merge the result if applied."""
+        try:
+            from dialogs.saw_wave_dialog import SawWaveGeneratorDialog
+        except ImportError as exc:
+            messagebox.showerror("Generate Saw Wave", f"Failed to load generator dialog: {exc}")
+            return
+
+        dialog = SawWaveGeneratorDialog(self)
+        generated_data = dialog.show()
+        if generated_data is None:
+            return
+
+        self._operation_description = "Generate saw wave"
+        self.pwl_data = generated_data
+        self.update_table()
+        self.table_to_text_with_format()
+        self.update_plot()
+        self.mark_unsaved()
+
+    def repair_waveform(self):
+        """Open the waveform repair dialog and apply fixes if requested."""
+        if self.pwl_data.get_point_count() == 0:
+            messagebox.showinfo("Repair Waveform", "No waveform data to repair.")
+            return
+
+        try:
+            from dialogs.waveform_repair_dialog import WaveformRepairDialog
+        except ImportError as exc:
+            messagebox.showerror("Repair Waveform", f"Failed to load repair dialog: {exc}")
+            return
+
+        dialog = WaveformRepairDialog(self)
+        repaired_data = dialog.show()
+        if not repaired_data:
+            # Dialog already restored original data/state when cancelling or when no repair was needed
+            return
+
+        self._operation_description = "Repair waveform"
+        self.pwl_data = repaired_data
+        self.update_table()
+        self.table_to_text_with_format()
+        self.update_plot()
+        self.mark_unsaved()
+        self.status_var.set("Waveform repaired successfully")
 
     def sort_data(self):
         """Sort data points by time"""
@@ -1004,155 +1185,218 @@ class PWLEditor:
         return self.format_service.format_engineering(value)
 
     def convert_time_to_si(self):
-        """Convert time values to SI prefix notation"""
+        """Convert time values to SI prefix notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'time_str') and point.time_str:
-                    # Convert to proper SI prefix notation
                     time_val = point.get_time_value()
                     si_str = self._format_si_prefix(time_val)
                     point.update_time_str(si_str)
-            
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No time values converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("Time values converted to SI prefix notation")
+            if selection:
+                self.status_var.set(f"Converted time to SI prefix for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("Time values converted to SI prefix notation")
         except Exception as e:
             self.status_var.set(f"Error converting time to SI: {e}")
 
     def convert_time_to_scientific(self):
-        """Convert time values to scientific notation"""
+        """Convert time values to scientific notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'time_str') and point.time_str:
-                    # Convert to improved scientific notation
                     time_val = point.get_time_value()
                     sci_str = self._format_scientific(time_val)
                     point.update_time_str(sci_str)
-            
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No time values converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("Time values converted to scientific notation")
+            if selection:
+                self.status_var.set(f"Converted time to scientific notation for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("Time values converted to scientific notation")
         except Exception as e:
             self.status_var.set(f"Error converting time to scientific: {e}")
 
     def convert_value_to_si(self):
-        """Convert value data to SI prefix notation"""
+        """Convert value data to SI prefix notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'value_str') and point.value_str:
-                    # Convert to proper SI prefix notation
                     value_val = point.get_value_value()
                     si_str = self._format_si_prefix(value_val)
                     point.update_value_str(si_str)
-            
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No values converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("Values converted to SI prefix notation")
+            if selection:
+                self.status_var.set(f"Converted values to SI prefix for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("Values converted to SI prefix notation")
         except Exception as e:
             self.status_var.set(f"Error converting values to SI: {e}")
 
     def convert_value_to_scientific(self):
-        """Convert value data to scientific notation"""
+        """Convert value data to scientific notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'value_str') and point.value_str:
-                    # Convert to improved scientific notation
                     value_val = point.get_value_value()
                     sci_str = self._format_scientific(value_val)
                     point.update_value_str(sci_str)
-            
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No values converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("Values converted to scientific notation")
+            if selection:
+                self.status_var.set(f"Converted values to scientific notation for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("Values converted to scientific notation")
         except Exception as e:
             self.status_var.set(f"Error converting values to scientific: {e}")
 
     def convert_all_to_si(self):
-        """Convert all data (time and values) to SI prefix notation"""
+        """Convert time and values to SI prefix notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'time_str') and point.time_str:
                     time_val = point.get_time_value()
-                    si_str = self._format_si_prefix(time_val)
-                    point.update_time_str(si_str)
+                    point.update_time_str(self._format_si_prefix(time_val))
                 if hasattr(point, 'value_str') and point.value_str:
                     value_val = point.get_value_value()
-                    si_str = self._format_si_prefix(value_val)
-                    point.update_value_str(si_str)
-            
+                    point.update_value_str(self._format_si_prefix(value_val))
+                converted += 1
+
+            if converted == 0:
+                self.status_var.set("No points converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("All data converted to SI prefix notation")
+            if selection:
+                self.status_var.set(f"Converted SI prefix for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("All data converted to SI prefix notation")
         except Exception as e:
-            self.status_var.set(f"Error converting all to SI: {e}")
+            self.status_var.set(f"Error converting to SI: {e}")
 
     def convert_all_to_scientific(self):
-        """Convert all data (time and values) to scientific notation"""
+        """Convert time and values to scientific notation (selection-aware)."""
         try:
-            for point in self.pwl_data.points:
+            selection = self._get_selected_point_indices()
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
+                return
+
+            targets = selection if selection else list(range(point_count))
+            converted = 0
+            for index in targets:
+                point = self.pwl_data.points[index]
                 if hasattr(point, 'time_str') and point.time_str:
                     time_val = point.get_time_value()
-                    sci_str = self._format_scientific(time_val)
-                    point.update_time_str(sci_str)
+                    point.update_time_str(self._format_scientific(time_val))
                 if hasattr(point, 'value_str') and point.value_str:
                     value_val = point.get_value_value()
-                    sci_str = self._format_scientific(value_val)
-                    point.update_value_str(sci_str)
+                    point.update_value_str(self._format_scientific(value_val))
+                converted += 1
             
+            if converted == 0:
+                self.status_var.set("No points converted")
+                return
+
             self.update_table()
+            self._reselect_table_indices(selection)
             self.table_to_text_with_format()
+            self.update_plot(selection if selection else None)
             self.mark_unsaved()
-            self.status_var.set("All data converted to scientific notation")
+            if selection:
+                self.status_var.set(f"Converted scientific notation for {converted} selected point{'s' if converted != 1 else ''}")
+            else:
+                self.status_var.set("All data converted to scientific notation")
         except Exception as e:
             self.status_var.set(f"Error converting all to scientific: {e}")
-
-    def restore_original_formatting(self):
-        """Restore original formatting from when the file was loaded"""
-        try:
-            # Restore from backup display strings if available
-            restored_count = 0
-            for point in self.pwl_data.points:
-                if hasattr(point, 'display_time_str') and point.display_time_str:
-                    point.original_time_str = point.display_time_str
-                    delattr(point, 'display_time_str')
-                    restored_count += 1
-                if hasattr(point, 'display_value_str') and point.display_value_str:
-                    point.original_value_str = point.display_value_str
-                    delattr(point, 'display_value_str')
-                    restored_count += 1
-            
-            if restored_count > 0:
-                self.update_table()
-                self.table_to_text_with_format()
-                self.mark_unsaved()
-                self.status_var.set("Original formatting restored")
-            else:
-                # If no backup available, reload from file
-                if self.current_file:
-                    if messagebox.askyesno("Restore Original", 
-                        "No backup available. Reload file to restore original formatting? This will lose any unsaved changes."):
-                        # Reload the current file
-                        new_pwl_data = PwlData()
-                        if new_pwl_data.load_from_file(self.current_file, 0.001):
-                            self.pwl_data = new_pwl_data
-                            self.update_table()
-                            self.update_plot()
-                            self.table_to_text()
-                            self.unsaved_changes = False
-                            self.update_title()
-                            self.status_var.set("Original formatting restored from file")
-                        else:
-                            messagebox.showerror("Error", "Failed to reload file")
-                else:
-                    messagebox.showinfo("Restore Original", 
-                        "No file loaded and no backup available.")
-        except Exception as e:
-            self.status_var.set(f"Error restoring original formatting: {e}")
 
     def new_file(self):
         """Create new file - delegate to DocumentService"""
@@ -1169,6 +1413,10 @@ class PWLEditor:
     def save_file_as(self):
         """Save file with new name - delegate to DocumentService"""
         return self.document_service.save_file_as()
+
+    def export_file(self):
+        """Export current data without changing the active document."""
+        return self.document_service.export_file()
 
     def on_text_changed(self, event):
         """Handle text editor changes with real-time validation"""
@@ -1206,70 +1454,159 @@ class PWLEditor:
             self.parse_status_var.set(f"⚠ Error: {str(e)[:20]}...")
 
     def convert_to_relative(self):
-        """Convert text editor content to relative time format"""
+        """Convert the entire dataset to relative time format."""
         self._operation_description = "Convert to relative time"
         try:
-            # Parse current text content
-            text_content = self.text_editor.get(1.0, tk.END).strip()
-            if not text_content:
-                self.status_var.set("No text to convert")
+            point_count = self.pwl_data.get_point_count()
+            if point_count <= 1:
+                self.status_var.set("Not enough points to convert to relative time")
                 return
-            
-            # Load into temporary PWL data
-            temp_pwl_data = PwlData()
-            if temp_pwl_data.load_from_text(text_content):
-                # Convert to relative time format
-                relative_text = temp_pwl_data.to_text_precise(use_relative_time=True, precision=9)
-                
-                # Update text editor
-                self.text_editor.delete(1.0, tk.END)
-                self.text_editor.insert(1.0, relative_text)
-                
-                # Update main data and views
-                self.pwl_data = temp_pwl_data
-                self.update_table()
-                self.update_plot()
-                self.mark_unsaved()
-                
-                self.status_var.set("Converted to relative time format")
-            else:
-                messagebox.showerror("Conversion Error", "Invalid PWL text format. Cannot convert.")
-                
+
+            absolute_times = self.pwl_data.timestamps
+            converted = 0
+
+            # Ensure first point remains absolute without altering existing formatting
+            first_point = self.pwl_data.points[0]
+            first_point.is_relative = False
+
+            for index in range(1, point_count):
+                original_time = self.pwl_data.points[index].time_str
+                if self._apply_time_representation(
+                    self.pwl_data,
+                    index,
+                    make_relative=True,
+                    reference_time_str=original_time,
+                    absolute_times=absolute_times,
+                ):
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No points converted to relative time")
+                return
+
+            self.pwl_data.default_format = 'relative'
+            self.update_table()
+            self.table_to_text_with_format()
+            self.update_plot()
+            self.mark_unsaved()
+            self.status_var.set("Converted all points to relative time format")
         except Exception as e:
             messagebox.showerror("Conversion Error", f"Failed to convert to relative time: {e}")
 
     def convert_to_absolute(self):
-        """Convert text editor content to absolute time format"""
+        """Convert the entire dataset to absolute time format."""
         self._operation_description = "Convert to absolute time"
         try:
-            # Parse current text content
-            text_content = self.text_editor.get(1.0, tk.END).strip()
-            if not text_content:
-                self.status_var.set("No text to convert")
+            point_count = self.pwl_data.get_point_count()
+            if point_count == 0:
+                self.status_var.set("No data to convert")
                 return
-            
-            # Load into temporary PWL data
-            temp_pwl_data = PwlData()
-            if temp_pwl_data.load_from_text(text_content):
-                # Convert to absolute time format
-                absolute_text = temp_pwl_data.to_text_precise(use_relative_time=False, precision=9)
-                
-                # Update text editor
-                self.text_editor.delete(1.0, tk.END)
-                self.text_editor.insert(1.0, absolute_text)
-                
-                # Update main data and views
-                self.pwl_data = temp_pwl_data
-                self.update_table()
-                self.update_plot()
-                self.mark_unsaved()
-                
-                self.status_var.set("Converted to absolute time format")
-            else:
-                messagebox.showerror("Conversion Error", "Invalid PWL text format. Cannot convert.")
-                
+
+            absolute_times = self.pwl_data.timestamps
+            converted = 0
+            for index in range(point_count):
+                original_time = self.pwl_data.points[index].time_str
+                if self._apply_time_representation(
+                    self.pwl_data,
+                    index,
+                    make_relative=False,
+                    reference_time_str=original_time,
+                    absolute_times=absolute_times,
+                ):
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No points converted to absolute time")
+                return
+
+            self.pwl_data.default_format = 'absolute'
+            self.update_table()
+            self.table_to_text_with_format()
+            self.update_plot()
+            self.mark_unsaved()
+            self.status_var.set("Converted all points to absolute time format")
         except Exception as e:
             messagebox.showerror("Conversion Error", f"Failed to convert to absolute time: {e}")
+
+    def convert_time_selection_to_relative(self):
+        """Convert selected points to relative time; fallback to all when none selected."""
+        selection = self._get_selected_point_indices()
+        if not selection:
+            self.convert_to_relative()
+            return
+
+        try:
+            self._operation_description = "Convert selection to relative time"
+            absolute_times = self.pwl_data.timestamps
+            converted = 0
+            skipped_first = False
+            for index in selection:
+                original_time = self.pwl_data.points[index].time_str
+                if self._apply_time_representation(
+                    self.pwl_data,
+                    index,
+                    make_relative=True,
+                    reference_time_str=original_time,
+                    absolute_times=absolute_times,
+                ):
+                    converted += 1
+                elif index == 0:
+                    skipped_first = True
+
+            if converted == 0:
+                message = "No points converted to relative time"
+                if skipped_first:
+                    message += " (first point must remain absolute)"
+                self.status_var.set(message)
+                return
+
+            self.update_table()
+            self._reselect_table_indices(selection)
+            self.table_to_text_with_format()
+            self.update_plot(selection)
+            self.mark_unsaved()
+
+            message = f"Converted {converted} selected point{'s' if converted != 1 else ''} to relative time"
+            if skipped_first:
+                message += " (first point left absolute)"
+            self.status_var.set(message)
+        except Exception as e:
+            self.status_var.set(f"Error converting selection to relative time: {e}")
+
+    def convert_time_selection_to_absolute(self):
+        """Convert selected points to absolute time; fallback to all when none selected."""
+        selection = self._get_selected_point_indices()
+        if not selection:
+            self.convert_to_absolute()
+            return
+
+        try:
+            self._operation_description = "Convert selection to absolute time"
+            absolute_times = self.pwl_data.timestamps
+            converted = 0
+            for index in selection:
+                original_time = self.pwl_data.points[index].time_str
+                if self._apply_time_representation(
+                    self.pwl_data,
+                    index,
+                    make_relative=False,
+                    reference_time_str=original_time,
+                    absolute_times=absolute_times,
+                ):
+                    converted += 1
+
+            if converted == 0:
+                self.status_var.set("No points converted to absolute time")
+                return
+
+            self.update_table()
+            self._reselect_table_indices(selection)
+            self.table_to_text_with_format()
+            self.update_plot(selection)
+            self.mark_unsaved()
+            self.status_var.set(f"Converted {converted} selected point{'s' if converted != 1 else ''} to absolute time")
+        except Exception as e:
+            self.status_var.set(f"Error converting selection to absolute time: {e}")
 
     def mark_unsaved(self):
         """Mark file as having unsaved changes"""
@@ -1289,6 +1626,22 @@ class PWLEditor:
     def check_unsaved_changes(self):
         """Check for unsaved changes and prompt user"""
         if self.unsaved_changes:
+            try:
+                has_data = self.pwl_data.get_point_count() > 0
+            except Exception:
+                has_data = False
+
+            text_dirty = False
+            try:
+                text_dirty = bool(self.text_editor.get(1.0, tk.END).strip())
+            except Exception:
+                pass
+
+            if self.current_file is None and not has_data and not text_dirty:
+                # Treat pristine startup state as clean even if a flag was toggled
+                self.unsaved_changes = False
+                return True
+
             result = messagebox.askyesnocancel(
                 "Unsaved Changes",
                 "You have unsaved changes. Do you want to save before continuing?"

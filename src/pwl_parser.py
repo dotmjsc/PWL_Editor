@@ -117,8 +117,9 @@ class PwlPoint:
 class PwlData:
     def __init__(self):
         self.points = []                  # List of PwlPoint objects
-        self.values_discrete = []
-        self.timestamps_discrete = []
+        self._values_discrete = []
+        self._timestamps_discrete = []
+        self._discrete_dirty = True
         self.timestep = 0.001             # Default timestep for discretization
         self.default_format = 'relative'  # 'relative', 'absolute', 'mixed'
     
@@ -141,11 +142,16 @@ class PwlData:
     def clear(self):
         """Clear all data points"""
         self.points.clear()
-        self.values_discrete.clear()
-        self.timestamps_discrete.clear()
+        self._update_discrete()
     
     def add_point(self, time_str, value_str, is_relative=None):
         """Add a single point and maintain time ordering"""
+        # Coerce numeric inputs to string form for downstream formatting logic
+        if isinstance(time_str, (int, float)):
+            time_str = f"{time_str:g}"
+        if isinstance(value_str, (int, float)):
+            value_str = f"{value_str:g}"
+
         # Auto-detect format if not specified
         if is_relative is None:
             is_relative = len(self.points) > 0 and self.default_format == 'relative'
@@ -175,7 +181,7 @@ class PwlData:
                 insert_pos = i + 1
             else:
                 break
-        
+
         self.points.insert(insert_pos, new_point)
         self._update_relative_times_after_insert(insert_pos)
         self._update_discrete()
@@ -301,20 +307,47 @@ class PwlData:
                 # Update the time string to reflect the new delta
                 self.points[i].update_time_str(f"{delta:.9g}")
     
-    def _update_discrete(self):
-        """Update discrete values based on current data"""
+    def _ensure_discrete(self):
+        """Compute discrete samples if the cache is marked dirty."""
+        if not self._discrete_dirty:
+            return
+
         if len(self.points) > 0:
             timestamps = self.timestamps  # Use property to get absolute times
             values = self.values         # Use property to get values
-            result = discretize(timestamps, values, self.timestep)
-            if result is not None:
-                self.timestamps_discrete, self.values_discrete = result
+            try:
+                result = discretize(timestamps, values, self.timestep)
+            except (MemoryError, ValueError, OverflowError) as exc:
+                logging.warning("PWL Parser: Discrete series skipped (%s)", exc)
+                self._timestamps_discrete = []
+                self._values_discrete = []
             else:
-                self.timestamps_discrete = []
-                self.values_discrete = []
+                if result is not None:
+                    self._timestamps_discrete, self._values_discrete = result
+                else:
+                    self._timestamps_discrete = []
+                    self._values_discrete = []
         else:
-            self.timestamps_discrete = []
-            self.values_discrete = []
+            self._timestamps_discrete = []
+            self._values_discrete = []
+
+        self._discrete_dirty = False
+
+    def _update_discrete(self):
+        """Mark discrete data dirty; it will be recomputed on demand."""
+        self._discrete_dirty = True
+        self._timestamps_discrete = []
+        self._values_discrete = []
+
+    @property
+    def timestamps_discrete(self):
+        self._ensure_discrete()
+        return self._timestamps_discrete
+
+    @property
+    def values_discrete(self):
+        self._ensure_discrete()
+        return self._values_discrete
     
     def set_timestep(self, timestep):
         """Set timestep for discretization and update"""
@@ -638,10 +671,15 @@ class PwlData:
         logging.info('PWL Parser: PWL data load successful')
         # Guard against empty lists during edge cases
         total_run_time = max(timestamps) if len(timestamps) > 0 else 0.0
-        total_smu_time = max(self.timestamps_discrete) if len(self.timestamps_discrete) > 0 else 0.0
+        if not self._discrete_dirty and len(self._timestamps_discrete) > 0:
+            total_smu_time = max(self._timestamps_discrete)
+            discrete_count = len(self._timestamps_discrete)
+        else:
+            total_smu_time = 0.0
+            discrete_count = 0
         logging.info('PWL Parser: Total PWL file run time: %0.3f s' % total_run_time)
         logging.info('PWL Parser: Total SMU run time: %0.3f s' % total_smu_time)
-        logging.info('PWL Parser: Nr of points: %d' % len(self.timestamps_discrete))
+        logging.info('PWL Parser: Nr of points: %d' % discrete_count)
 
         return True
 

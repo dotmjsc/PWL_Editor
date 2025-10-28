@@ -1,7 +1,7 @@
 """
-PWL Editor GUI Geometry - Layout and Widget Creation
+PWL Editor GUI geometry and widget construction helpers.
 Author: markus(at)schrodt.at
-AI Tools: Claude Sonnet 4 (Anthropic) - Code development and architecture
+AI Tools: Claude Sonnet 4 (Anthropic); GPT-5 (OpenAI) - Code development and architecture
 License: GPL-3.0-or-later
 """
 
@@ -39,6 +39,9 @@ class PWLEditorGeometry:
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self._callback('save_file'), accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self._callback('save_file_as'), accelerator="Ctrl+Shift+S")
+        file_menu.add_command(label="Export...", command=self._callback('export_file'))
+        file_menu.add_separator()
+        file_menu.add_command(label="About PWL Editor...", command=self._callback('show_about_dialog'))
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._callback('on_closing'))
         
@@ -53,6 +56,9 @@ class PWLEditorGeometry:
         # Format menu
         format_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Format", menu=format_menu)
+        format_menu.add_command(label="Convert Time → Relative", command=self._callback('convert_time_selection_to_relative'))
+        format_menu.add_command(label="Convert Time → Absolute", command=self._callback('convert_time_selection_to_absolute'))
+        format_menu.add_separator()
         format_menu.add_command(label="Convert Time to SI Prefix", command=self._callback('convert_time_to_si'))
         format_menu.add_command(label="Convert Time to Scientific", command=self._callback('convert_time_to_scientific'))
         format_menu.add_command(label="Convert Value to SI Prefix", command=self._callback('convert_value_to_si'))
@@ -61,7 +67,36 @@ class PWLEditorGeometry:
         format_menu.add_command(label="Convert All to SI Prefix", command=self._callback('convert_all_to_si'))
         format_menu.add_command(label="Convert All to Scientific", command=self._callback('convert_all_to_scientific'))
         format_menu.add_separator()
-        format_menu.add_command(label="Restore Original Formatting", command=self._callback('restore_original_formatting'))
+
+        self.export_format_var = tk.StringVar(value="Preserve Mixed")
+        export_format_menu = tk.Menu(format_menu, tearoff=0)
+        export_format_menu.add_radiobutton(
+            label="Preserve Mixed",
+            variable=self.export_format_var,
+            value="Preserve Mixed",
+            command=self._callback('on_export_format_changed'),
+        )
+        export_format_menu.add_radiobutton(
+            label="Force Relative",
+            variable=self.export_format_var,
+            value="Force Relative",
+            command=self._callback('on_export_format_changed'),
+        )
+        export_format_menu.add_radiobutton(
+            label="Force Absolute",
+            variable=self.export_format_var,
+            value="Force Absolute",
+            command=self._callback('on_export_format_changed'),
+        )
+        format_menu.add_cascade(label="Export Format", menu=export_format_menu)
+
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Generate Square Wave...", command=self._callback('generate_square_wave'))
+        tools_menu.add_command(label="Generate Triangle Wave...", command=self._callback('generate_triangle_wave'))
+        tools_menu.add_command(label="Generate Saw Wave...", command=self._callback('generate_saw_wave'))
+        tools_menu.add_command(label="Repair Waveform...", command=self._callback('repair_waveform'))
         
         # Keyboard shortcuts
         self.root.bind('<Control-n>', lambda e: self._callback('new_file')())
@@ -73,6 +108,8 @@ class PWLEditorGeometry:
         self.root.bind('<Control-z>', lambda e: self._callback('undo')())
         self.root.bind('<Control-y>', lambda e: self._callback('redo')())
         self.root.bind('<Control-Z>', lambda e: self._callback('redo')())  # Ctrl+Shift+Z
+
+        self.widgets['export_format_var'] = self.export_format_var
     
     def _callback(self, method_name):
         def wrapper(*args, **kwargs):
@@ -173,36 +210,14 @@ class PWLEditorGeometry:
         self.table.bind('<Return>', self._callback('start_inline_edit'))
         self.table.bind('<Delete>', self._callback('remove_selected'))
         self.table.bind('<<TreeviewSelect>>', self._callback('on_table_select'))
+        self.table.bind('<Control-a>', self._callback('select_all_points'))
+        self.table.bind('<Control-A>', self._callback('select_all_points'))
 
     def create_text_view(self):
         """Create text editor view for direct PWL editing"""
         # Text tab
         self.text_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.text_frame, text="Text")
-        
-        # Conversion buttons frame
-        convert_frame = ttk.Frame(self.text_frame)
-        convert_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(convert_frame, text="Convert Time Format:").pack(side=tk.LEFT, padx=5)
-        ttk.Button(convert_frame, text="To Relative Time", command=self._callback('convert_to_relative')).pack(side=tk.LEFT, padx=5)
-        ttk.Button(convert_frame, text="To Absolute Time", command=self._callback('convert_to_absolute')).pack(side=tk.LEFT, padx=5)
-        
-        # Export format dropdown
-        ttk.Label(convert_frame, text="Export Format:").pack(side=tk.LEFT, padx=(20, 5))
-        self.export_format_var = tk.StringVar(value="preserve_mixed")
-        export_formats = [
-            ("Preserve Mixed", "preserve_mixed"),
-            ("Force Relative", "force_relative"), 
-            ("Force Absolute", "force_absolute")
-        ]
-        self.export_format_combo = ttk.Combobox(convert_frame, textvariable=self.export_format_var, 
-                                               values=[fmt[0] for fmt in export_formats], 
-                                               state="readonly", width=15)
-        self.export_format_combo.pack(side=tk.LEFT, padx=5)
-        
-        # Update text when format changes
-        self.export_format_combo.bind('<<ComboboxSelected>>', self._callback('on_export_format_changed'))
         
         # Text editor with scrollbars
         text_container = ttk.Frame(self.text_frame)
@@ -225,8 +240,7 @@ class PWLEditorGeometry:
         
         # Store widget references
         self.widgets['text_editor'] = self.text_editor
-        self.widgets['export_format_var'] = self.export_format_var
-        
+
         # Bind text change event
         self.text_editor.bind('<KeyRelease>', self._callback('on_text_changed'))
 

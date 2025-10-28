@@ -50,6 +50,16 @@ Thumbs.db
 *.bak
 *~
 
+# Pytest / testing artifacts
+.pytest_cache/
+.cache/
+.coverage
+coverage.xml
+htmlcov/
+junit.xml
+report.xml
+pytest.ini
+
 # Test files
 test_*.py
 *_test.py

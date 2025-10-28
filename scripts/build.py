@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PWL Editor Build Script
+Build automation for the PWL Editor.
 Author: markus(at)schrodt.at
-AI Tools: Claude Sonnet 4 (Anthropic) - Code development and architecture
+AI Tools: Claude Sonnet 4 (Anthropic); GPT-5 (OpenAI) - Code development and architecture
 License: GPL-3.0-or-later
 
 This script builds the PWL Editor using PyInstaller and organizes the output
@@ -15,7 +15,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-# Import version from current directory (we're now in src)
+# Ensure project root and src are on sys.path so package imports resolve
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+SRC_ROOT = ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from version import get_version
 
 def run_command(cmd, cwd=None):
