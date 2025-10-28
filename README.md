@@ -110,10 +110,13 @@ If you prefer to run from source code:
 
 ### For Developers
 
-- Build script: `scripts/build.py`
-- Services source-of-truth:
-  - `services/insertion_service.py` (SmartInsertion)
-  - `services/undo_history.py` (UndoRedoManager)
+- Entry point: `src/pwl_gui.py`
+- Build artifact: `python scripts/build.py`
+- Core modules:
+   - `src/controllers/` – table/text/plot coordination
+   - `src/services/` – file IO, formatting, undo history, waveform repair
+   - `src/dialogs/` – generator and repair UIs
+   - `src/generators/` – waveform synthesis helpers
 
 ## PWL Format
 
