@@ -180,19 +180,6 @@ python pwl_parser.py
 
 This will load and process the test file, demonstrating the parser's capabilities.
 
-## Running Tests
-
-This repository uses pytest with a minimal configuration:
-
-- `pytest.ini` restricts discovery to the `tests/` folder and adds `src/` to `PYTHONPATH`.
-- Run the full suite from the project root:
-
-```bash
-pytest -q
-```
-
-This avoids ad-hoc root-level scripts being picked up as tests and simplifies imports in test files (no `sys.path` hacks needed).
-
 ## License
 
 GPL-3.0-or-later
